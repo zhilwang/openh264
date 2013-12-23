@@ -98,6 +98,8 @@ BITS 64
 %define r4d eax
 %define r5d r10d
 
+%define RETURN_VALUE rax
+
 %elifdef UNIX64 ; Unix x64 ;************************************
 
 BITS 64
@@ -129,6 +131,8 @@ BITS 64
 %define r4d r8d
 %define r5d r9d
 
+%define RETURN_VALUE rax
+
 %elifdef X86_32 ; X86_32 ;************************************
 
 BITS 32
@@ -159,6 +163,9 @@ BITS 32
 %define r3d ebx
 %define r4d esi
 %define r5d edi
+
+%define RETURN_VALUE eax
+
 %endif
 
 %macro LOAD_PARA 2
@@ -230,6 +237,29 @@ BITS 32
 	%endif
 %endmacro
 
+%macro LOAD_7_PARA 0
+	%ifdef X86_32
+		push r3
+		push r4
+		push r5
+		push r6
+		%assign  push_num push_num+4	
+		mov r0, [esp + push_num*4 + 4]
+		mov r1, [esp + push_num*4 + 8]
+		mov r2, [esp + push_num*4 + 12]
+		mov r3, [esp + push_num*4 + 16]
+		mov r4, [esp + push_num*4 + 20]
+		mov r5, [esp + push_num*4 + 24]
+		mov r6, [esp + push_num*4 + 28]
+	%elifdef WIN64
+		mov r4, [rsp + push_num*8 + 40]
+		mov r5, [rsp + push_num*8 + 48]
+		mov r6, [rsp + push_num*8 + 56]
+	%elifdef UNIX64
+		mov r6, [rsp + push_num*8 + 8]
+	%endif
+%endmacro
+
 
 %macro LOAD_4_PARA_POP 0
 	%ifdef X86_32
@@ -246,6 +276,15 @@ BITS 32
 
 %macro LOAD_6_PARA_POP 0
 	%ifdef X86_32
+		pop r5
+		pop r4
+		pop r3
+	%endif
+%endmacro
+
+%macro LOAD_7_PARA_POP 0
+	%ifdef X86_32
+		pop r6
 		pop r5
 		pop r4
 		pop r3
