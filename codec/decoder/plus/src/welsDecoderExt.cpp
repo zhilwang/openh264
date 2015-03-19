@@ -44,7 +44,7 @@
 #include "welsCodecTrace.h"
 #include "codec_def.h"
 #include "typedefs.h"
-#include "mem_align.h"
+#include "memory_align.h"
 #include "utils.h"
 #include "version.h"
 
@@ -240,7 +240,7 @@ int32_t CWelsDecoder::InitDecoder (const bool bParseOnly) {
 
   if (m_pDecContext) //free
     UninitDecoder();
-  m_pDecContext	= (PWelsDecoderContext)WelsMalloc (sizeof (SWelsDecoderContext), "m_pDecContext");
+  m_pDecContext	= (PWelsDecoderContext)WelsMallocz (sizeof (SWelsDecoderContext), "m_pDecContext");
   if (NULL == m_pDecContext)
     return cmMallocMemeError;
 
@@ -285,6 +285,12 @@ long CWelsDecoder::SetOption (DECODER_OPTION eOptID, void* pOption) {
     iVal	= * ((int*)pOption);	// int value for error concealment idc
     iVal = WELS_CLIP3 (iVal, (int32_t) ERROR_CON_DISABLE, (int32_t) ERROR_CON_SLICE_MV_COPY_CROSS_IDR_FREEZE_RES_CHANGE);
     m_pDecContext->eErrorConMethod = (ERROR_CON_IDC) iVal;
+    if ((m_pDecContext->bParseOnly) && (m_pDecContext->eErrorConMethod != ERROR_CON_DISABLE)) {
+      WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_INFO,
+               "CWelsDecoder::SetOption for ERROR_CON_IDC = %d not allowd for parse only!.", iVal);
+      return cmInitParaError;
+    }
+
     InitErrorCon (m_pDecContext);
     WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_INFO,
              "CWelsDecoder::SetOption for ERROR_CON_IDC = %d.", iVal);
@@ -386,6 +392,22 @@ long CWelsDecoder::GetOption (DECODER_OPTION eOptID, void* pOption) {
   }
 
   return cmInitParaError;
+}
+
+DECODING_STATE CWelsDecoder::DecodeFrameNoDelay (const unsigned char* kpSrc,
+    const int kiSrcLen,
+    unsigned char** ppDst,
+    SBufferInfo* pDstInfo) {
+  int iRet;
+  SBufferInfo sTmpBufferInfo;
+  iRet = (int) DecodeFrame2 (kpSrc, kiSrcLen, ppDst, pDstInfo);
+  memcpy (&sTmpBufferInfo, pDstInfo, sizeof (SBufferInfo));
+  iRet |= DecodeFrame2 (NULL, 0, ppDst, pDstInfo);
+  if ((pDstInfo->iBufferStatus == 0) && (sTmpBufferInfo.iBufferStatus == 1)) {
+    memcpy (pDstInfo, &sTmpBufferInfo, sizeof (SBufferInfo));
+  }
+
+  return (DECODING_STATE) iRet;
 }
 
 DECODING_STATE CWelsDecoder::DecodeFrame2 (const unsigned char* kpSrc,
@@ -551,7 +573,11 @@ DECODING_STATE CWelsDecoder::DecodeParser (const unsigned char* kpSrc,
   }
 
   m_pDecContext->iErrorCode = dsErrorFree; //initialize at the starting of AU decoding.
-  m_pDecContext->pParserBsInfo = pDstInfo;
+  m_pDecContext->eErrorConMethod = ERROR_CON_DISABLE; //add protection to disable EC here.
+  if (!m_pDecContext->bFramePending) { //frame complete
+    m_pDecContext->pParserBsInfo->iNalNum = 0;
+    memset (m_pDecContext->pParserBsInfo->iNalLenInByte, 0, MAX_NAL_UNITS_IN_LAYER);
+  }
   pDstInfo->iNalNum = 0;
   pDstInfo->iSpsWidthInPixel = pDstInfo->iSpsHeightInPixel = 0;
   if (pDstInfo) {
@@ -561,6 +587,11 @@ DECODING_STATE CWelsDecoder::DecodeParser (const unsigned char* kpSrc,
     m_pDecContext->uiTimeStamp = 0;
   }
   WelsDecodeBs (m_pDecContext, kpSrc, kiSrcLen, NULL, NULL, pDstInfo);
+  if (!m_pDecContext->bFramePending && m_pDecContext->pParserBsInfo->iNalNum) {
+    memcpy (pDstInfo, m_pDecContext->pParserBsInfo, sizeof (SParserBsInfo));
+  }
+
+  m_pDecContext->bInstantDecFlag = false; //reset no-delay flag
 
   return (DECODING_STATE) m_pDecContext->iErrorCode;
 }

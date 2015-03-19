@@ -64,8 +64,7 @@
  */
 ///
 /// E.g. SDK version is 1.2.0.0, major version number is 1, minor version number is 2, and revision number is 0.
-typedef struct  _tagVersion
-{
+typedef struct  _tagVersion {
   unsigned int uMajor;				///< The major version number
   unsigned int uMinor;				///< The minor version number
   unsigned int uRevision;				///< The revision number
@@ -372,8 +371,9 @@ typedef struct {
 * @brief Encoder usage type
 */
 typedef enum {
-  CAMERA_VIDEO_REAL_TIME,      ///< camera video signal
-  SCREEN_CONTENT_REAL_TIME     ///< screen content signal
+  CAMERA_VIDEO_REAL_TIME,      ///< camera video for real-time communication
+  SCREEN_CONTENT_REAL_TIME,    ///< screen content signal
+  CAMERA_VIDEO_NON_REAL_TIME
 } EUsageType;
 
 /**
@@ -384,6 +384,17 @@ typedef enum {
   MEDIUM_COMPLEXITY,          ///< medium complexity, medium speed,medium quality
   HIGH_COMPLEXITY             ///< high complexity, lowest speed, high quality
 } ECOMPLEXITY_MODE;
+
+/**
+ * @brief Enumulate for the stategy of SPS/PPS strategy
+ */
+typedef enum {
+  CONSTANT_ID = 0,           ///< constant id in SPS/PPS
+  INCREASING_ID = 0x01,      ///< SPS/PPS id increases at each IDR
+  SPS_LISTING  = 0x02,       ///< using SPS in the existing list if possible
+  SPS_LISTING_AND_PPS_INCREASING  = 0x03,
+  SPS_PPS_LISTING  = 0x06,
+} EParameterSetStrategy;
 
 // TODO:  Refine the parameters definition.
 /**
@@ -421,9 +432,11 @@ typedef struct TagEncParamExt {
   ECOMPLEXITY_MODE iComplexityMode;
   unsigned int      uiIntraPeriod;     ///< period of Intra frame
   int               iNumRefFrame;      ///< number of reference frame used
-  bool    bEnableSpsPpsIdAddition;     ///< false:not adjust ID in SPS/PPS; true: adjust ID in SPS/PPS
+  EParameterSetStrategy
+  eSpsPpsIdStrategy;       ///< different stategy in adjust ID in SPS/PPS: 0- constant ID, 1-additional ID, 6-mapping and additional
   bool    bPrefixNalAddingCtrl;        ///< false:not use Prefix NAL; true: use Prefix NAL
-  bool    bEnableSSEI;                 ///< false:not use SSEI; true: use SSEI
+  bool    bEnableSSEI;                 ///< false:not use SSEI; true: use SSEI -- TODO: planning to remove the interface of SSEI
+  bool    bSimulcastAVC;               ///< (when encoding more than 1 spatial layer) false: use SVC syntax for higher layers; true: use Simulcast AVC -- coming soon
   int     iPaddingFlag;                ///< 0:disable padding;1:padding
   int     iEntropyCodingModeFlag;      ///< 0:CAVLC  1:CABAC.
 
@@ -619,6 +632,8 @@ typedef struct TagVideoEncoderStatistics {
   unsigned int uiIDRReqNum;                    ///< number of IDR requests
   unsigned int uiIDRSentNum;                   ///< number of actual IDRs sent
   unsigned int uiLTRSentNum;                   ///< number of LTR sent/marked
+
+  long long    iStatisticsTs;                  ///< Timestamp of updating the statistics
 } SEncoderStatistics; // in building, coming soon
 
 /**
@@ -640,10 +655,16 @@ typedef struct TagVideoDecoderStatistics {
   unsigned int uiEcIDRNum;                     ///< number of actual unintegrity IDR or not received but eced
   unsigned int uiEcFrameNum;                   ///<
   unsigned int uiIDRLostNum;                   ///< number of whole lost IDR
-  unsigned int uiFreezingIDRNum;               ///< number of freezing IDR with error (partly received), under resolution change
+  unsigned int
+  uiFreezingIDRNum;               ///< number of freezing IDR with error (partly received), under resolution change
   unsigned int uiFreezingNonIDRNum;            ///< number of freezing non-IDR with error
   int iAvgLumaQp;                              ///< average luma QP. default: -1, no correct frame outputted
-
+  int iSpsReportErrorNum;             ///< number of Sps Invalid report
+  int iSubSpsReportErrorNum;          ///< number of SubSps Invalid report
+  int iPpsReportErrorNum;             ///< number of Pps Invalid report
+  int			iSpsNoExistNalNum;          ///< number of Sps NoExist Nal
+  int			iSubSpsNoExistNalNum;       ///< number of SubSps NoExist Nal
+  int			iPpsNoExistNalNum;          ///< number of Pps NoExist Nal
 } SDecoderStatistics; // in building, coming soon
 
 #endif//WELS_VIDEO_CODEC_APPLICATION_DEFINITION_H__

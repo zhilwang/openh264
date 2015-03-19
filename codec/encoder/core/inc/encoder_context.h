@@ -191,6 +191,7 @@ typedef struct TagWelsEncCtx {
   SSubsetSps*					pSubsetArray;	// MAX_SPS_COUNT by standard compatible
   SSubsetSps*					pSubsetSps;
   int32_t						iSpsNum;	// number of pSps used
+  int32_t						iSubsetSpsNum;	// number of pSps used
   int32_t						iPpsNum;	// number of pPps used
 
 // Output
@@ -201,10 +202,10 @@ typedef struct TagWelsEncCtx {
 
   SSpatialPicIndex			sSpatialIndexMap[MAX_DEPENDENCY_LAYER];
 
-  bool						bLongTermRefFlag[MAX_DEPENDENCY_LAYER][MAX_TEMPORAL_LEVEL + 1/*+LONG_TERM_REF_NUM*/];
+  bool						bRefOfCurTidIsLtr[MAX_DEPENDENCY_LAYER][MAX_TEMPORAL_LEVEL];
   uint16_t        uiIdrPicId;		// IDR picture id: [0, 65535], this one is used for LTR
 
-  int16_t						iMaxSliceCount;// maximal count number of slices for all layers observation
+  int32_t						iMaxSliceCount;// maximal count number of slices for all layers observation
   int16_t						iActiveThreadsNum;	// number of threads active so far
 
   /*
@@ -216,6 +217,7 @@ typedef struct TagWelsEncCtx {
   pDqIdcMap;	// overall DQ map of full scalability in specific frame (All full D/T/Q layers involved)												// pDqIdcMap[dq_index] for each SDqIdc pData
 
   SParaSetOffset				sPSOVector;
+  SParaSetOffset*				pPSOVector;
   CMemoryAlign*				pMemAlign;
 
 #if defined(STAT_OUTPUT)
@@ -241,6 +243,31 @@ typedef struct TagWelsEncCtx {
   bool bDependencyRecFlag[MAX_DEPENDENCY_LAYER];
   bool bRecFlag;
 #endif
+
+  uint32_t GetNeededSpsNum() {
+    if (0 == sPSOVector.uiNeededSpsNum) {
+      sPSOVector.uiNeededSpsNum = ((SPS_LISTING & pSvcParam->eSpsPpsIdStrategy) ? (MAX_SPS_COUNT) : (1));
+      sPSOVector.uiNeededSpsNum *= ((pSvcParam->bSimulcastAVC) ? (pSvcParam->iSpatialLayerNum) : (1));
+    }
+    return sPSOVector.uiNeededSpsNum;
+  }
+
+  uint32_t GetNeededSubsetSpsNum() {
+    if (0 == sPSOVector.uiNeededSubsetSpsNum) {
+      sPSOVector.uiNeededSubsetSpsNum = ((pSvcParam->bSimulcastAVC) ? (0) :
+                                         ((SPS_LISTING & pSvcParam->eSpsPpsIdStrategy) ? (MAX_SPS_COUNT) : (pSvcParam->iSpatialLayerNum - 1)));
+    }
+    return sPSOVector.uiNeededSubsetSpsNum;
+  }
+
+  uint32_t GetNeededPpsNum() {
+    if (0 == sPSOVector.uiNeededPpsNum) {
+      sPSOVector.uiNeededPpsNum = ((pSvcParam->eSpsPpsIdStrategy & SPS_PPS_LISTING) ? (MAX_PPS_COUNT) :
+                                   (1 + pSvcParam->iSpatialLayerNum));
+      sPSOVector.uiNeededPpsNum *= ((pSvcParam->bSimulcastAVC) ? (pSvcParam->iSpatialLayerNum) : (1));
+    }
+    return sPSOVector.uiNeededPpsNum;
+  }
 } sWelsEncCtx/*, *PWelsEncCtx*/;
 }
 #endif//sWelsEncCtx_H__

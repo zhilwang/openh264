@@ -22,12 +22,14 @@ V=Yes
 PREFIX=/usr/local
 SHARED=-shared
 OBJ=o
+DESTDIR=
 SHAREDLIB_DIR=$(PREFIX)/lib
 PROJECT_NAME=openh264
 MODULE_NAME=gmpopenh264
-GMP_API_BRANCH=Firefox36
+GMP_API_BRANCH=Firefox38
 CCASFLAGS=$(CFLAGS)
-VERSION=1.3
+VERSION=1.4
+STATIC_LDFLAGS=-lstdc++
 
 ifeq (,$(wildcard $(SRC_PATH)gmp-api))
 HAVE_GMP_API=No
@@ -46,7 +48,7 @@ ifeq ($(BUILDTYPE), Release)
 CFLAGS += $(CFLAGS_OPT)
 USE_ASM = Yes
 else
-CFLAGS = $(CFLAGS_DEBUG)
+CFLAGS += $(CFLAGS_DEBUG)
 USE_ASM = No
 endif
 
@@ -59,7 +61,7 @@ SHAREDLIBVERSION=0
 include $(SRC_PATH)build/platform-$(OS).mk
 
 
-CFLAGS +=
+CFLAGS += -DGENERATED_VERSION_HEADER
 LDFLAGS +=
 
 ifeq (Yes, $(GCOV))
@@ -104,6 +106,7 @@ GTEST_INCLUDES += \
 CODEC_UNITTEST_INCLUDES += \
     -I$(SRC_PATH)gtest/include \
     -I$(SRC_PATH)codec/common/inc \
+    -I$(SRC_PATH)test
 
 CONSOLE_COMMON_INCLUDES += \
     -I$(SRC_PATH)codec/console/common/inc
@@ -118,14 +121,20 @@ H264ENC_DEPS = $(LIBPREFIX)encoder.$(LIBSUFFIX) $(LIBPREFIX)processing.$(LIBSUFF
 
 CODEC_UNITTEST_LDFLAGS = $(LINK_LOCAL_DIR) $(call LINK_LIB,gtest) $(call LINK_LIB,decoder) $(call LINK_LIB,encoder) $(call LINK_LIB,processing) $(call LINK_LIB,common) $(CODEC_UNITTEST_LDFLAGS_SUFFIX)
 CODEC_UNITTEST_DEPS = $(LIBPREFIX)gtest.$(LIBSUFFIX) $(LIBPREFIX)decoder.$(LIBSUFFIX) $(LIBPREFIX)encoder.$(LIBSUFFIX) $(LIBPREFIX)processing.$(LIBSUFFIX) $(LIBPREFIX)common.$(LIBSUFFIX)
-DECODER_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(DECODER_INCLUDES) -I$(SRC_PATH)test -I$(SRC_PATH)test/decoder
-ENCODER_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(ENCODER_INCLUDES) -I$(SRC_PATH)test -I$(SRC_PATH)test/encoder
-PROCESSING_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(PROCESSING_INCLUDES) -I$(SRC_PATH)test -I$(SRC_PATH)test/processing
-API_TEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) -I$(SRC_PATH)test -I$(SRC_PATH)test/api
-COMMON_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(DECODER_INCLUDES) -I$(SRC_PATH)test -I$(SRC_PATH)test/common
+DECODER_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(DECODER_INCLUDES)
+ENCODER_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(ENCODER_INCLUDES)
+PROCESSING_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES) $(PROCESSING_INCLUDES)
+API_TEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES)
+COMMON_UNITTEST_INCLUDES += $(CODEC_UNITTEST_INCLUDES)
 MODULE_INCLUDES += -I$(SRC_PATH)gmp-api
 
-.PHONY: test gtest-bootstrap clean $(PROJECT_NAME).pc
+DECODER_UNITTEST_CFLAGS += $(CODEC_UNITTEST_CFLAGS)
+ENCODER_UNITTEST_CFLAGS += $(CODEC_UNITTEST_CFLAGS)
+PROCESSING_UNITTEST_CFLAGS += $(CODEC_UNITTEST_CFLAGS)
+API_TEST_CFLAGS += $(CODEC_UNITTEST_CFLAGS)
+COMMON_UNITTEST_CFLAGS += $(CODEC_UNITTEST_CFLAGS)
+
+.PHONY: test gtest-bootstrap clean $(PROJECT_NAME).pc $(PROJECT_NAME)-static.pc
 
 all: libraries binaries
 
@@ -139,7 +148,7 @@ clean:
 ifeq (android,$(OS))
 clean: clean_Android
 endif
-	$(QUIET)rm -f $(OBJS) $(OBJS:.$(OBJ)=.d) $(OBJS:.$(OBJ)=.obj) $(LIBRARIES) $(BINARIES) *.lib *.a *.dylib *.dll *.so
+	$(QUIET)rm -f $(OBJS) $(OBJS:.$(OBJ)=.d) $(OBJS:.$(OBJ)=.obj) $(LIBRARIES) $(BINARIES) *.lib *.a *.dylib *.dll *.so *.exe *.pdb *.exp *.pc
 
 gmp-bootstrap:
 	if [ ! -d gmp-api ] ; then git clone https://github.com/mozilla/gmp-api gmp-api ; fi
@@ -220,29 +229,36 @@ $(LIBPREFIX)$(MODULE_NAME).$(SHAREDLIBSUFFIX): $(LIBPREFIX)$(MODULE_NAME).$(SHAR
 endif
 
 $(PROJECT_NAME).pc: $(PROJECT_NAME).pc.in
-	@sed -e 's;@prefix@;$(PREFIX);' -e 's;@VERSION@;$(VERSION);' < $(PROJECT_NAME).pc.in > $(PROJECT_NAME).pc
+	@sed -e 's;@prefix@;$(PREFIX);' -e 's;@VERSION@;$(VERSION);' -e 's;@LIBS@;;' -e 's;@LIBS_PRIVATE@;$(STATIC_LDFLAGS);' < $(PROJECT_NAME).pc.in > $@
+
+$(PROJECT_NAME)-static.pc: $(PROJECT_NAME).pc.in
+	@sed -e 's;@prefix@;$(PREFIX);' -e 's;@VERSION@;$(VERSION);' -e 's;@LIBS@;$(STATIC_LDFLAGS);' -e 's;@LIBS_PRIVATE@;;' < $(PROJECT_NAME).pc.in > $@
 
 install-headers:
-	mkdir -p $(PREFIX)/include/wels
-	install -m 644 codec/api/svc/codec*.h $(PREFIX)/include/wels
+	mkdir -p $(DESTDIR)$(PREFIX)/include/wels
+	install -m 644 codec/api/svc/codec*.h $(DESTDIR)$(PREFIX)/include/wels
 
-install-static: $(LIBPREFIX)$(PROJECT_NAME).$(LIBSUFFIX) install-headers
-	mkdir -p $(PREFIX)/lib
-	install -m 644 $(LIBPREFIX)$(PROJECT_NAME).$(LIBSUFFIX) $(PREFIX)/lib
+install-static-lib: $(LIBPREFIX)$(PROJECT_NAME).$(LIBSUFFIX) install-headers
+	mkdir -p $(DESTDIR)$(PREFIX)/lib
+	install -m 644 $(LIBPREFIX)$(PROJECT_NAME).$(LIBSUFFIX) $(DESTDIR)$(PREFIX)/lib
+
+install-static: install-static-lib $(PROJECT_NAME)-static.pc
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	install -m 644 $(PROJECT_NAME)-static.pc $(DESTDIR)$(PREFIX)/lib/pkgconfig/$(PROJECT_NAME).pc
 
 install-shared: $(LIBPREFIX)$(PROJECT_NAME).$(SHAREDLIBSUFFIX) install-headers $(PROJECT_NAME).pc
-	mkdir -p $(SHAREDLIB_DIR)
-	install -m 755 $(LIBPREFIX)$(PROJECT_NAME).$(SHAREDLIBSUFFIXVER) $(SHAREDLIB_DIR)
+	mkdir -p $(DESTDIR)$(SHAREDLIB_DIR)
+	install -m 755 $(LIBPREFIX)$(PROJECT_NAME).$(SHAREDLIBSUFFIXVER) $(DESTDIR)$(SHAREDLIB_DIR)
 	if [ "$(SHAREDLIBSUFFIXVER)" != "$(SHAREDLIBSUFFIX)" ]; then \
-		cp -a $(LIBPREFIX)$(PROJECT_NAME).$(SHAREDLIBSUFFIX) $(SHAREDLIB_DIR); \
+		cp -a $(LIBPREFIX)$(PROJECT_NAME).$(SHAREDLIBSUFFIX) $(DESTDIR)$(SHAREDLIB_DIR); \
 	fi
-	mkdir -p $(PREFIX)/lib/pkgconfig
-	install -m 444 $(PROJECT_NAME).pc $(PREFIX)/lib/pkgconfig
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	install -m 644 $(PROJECT_NAME).pc $(DESTDIR)$(PREFIX)/lib/pkgconfig
 ifneq ($(EXTRA_LIBRARY),)
-	install -m 644 $(EXTRA_LIBRARY) $(PREFIX)/lib
+	install -m 644 $(EXTRA_LIBRARY) $(DESTDIR)$(PREFIX)/lib
 endif
 
-install: install-static install-shared
+install: install-static-lib install-shared
 	@:
 
 ifeq ($(HAVE_GTEST),Yes)

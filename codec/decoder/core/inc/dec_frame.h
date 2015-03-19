@@ -69,7 +69,7 @@ struct TagDqLayer {
   int16_t	(*pMvd[LIST_A])[MB_BLOCK4x4_NUM][MV_A];
   int8_t	(*pRefIndex[LIST_A])[MB_BLOCK4x4_NUM];
   int8_t*  pLumaQp;
-  int8_t*  pChromaQp;
+  int8_t  (*pChromaQp)[2];
   int8_t*  pCbp;
   uint8_t *pCbfDc;
   int8_t (*pNzc)[24];
@@ -102,13 +102,16 @@ struct TagDqLayer {
   int32_t					iInterLayerSliceBetaOffset;
   //SPosOffset			sScaledRefLayer;
   int32_t					iSliceGroupChangeCycle;
+  
   PRefPicListReorderSyn	pRefPicListReordering;
+  PPredWeightTabSyn     pPredWeightTable;
   PRefPicMarking          pRefPicMarking; // Decoded reference picture marking syntaxs
   PRefBasePicMarking	    pRefPicBaseMarking;
 
   PPicture				pRef;			// reference picture pointer
   PPicture				pDec;			// reconstruction picture pointer for layer
 
+    bool    bUseWeightPredictionFlag;
   bool					bStoreRefBasePicFlag;				// iCurTid == 0 && iCurQid = 0 && bEncodeKeyPic = 1
   bool					bTCoeffLevelPredFlag;
   bool					bConstrainedIntraResamplingFlag;

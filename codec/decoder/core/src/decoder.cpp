@@ -51,7 +51,7 @@
 #include "expand_pic.h"
 #include "decode_slice.h"
 #include "error_concealment.h"
-#include "mem_align.h"
+#include "memory_align.h"
 
 namespace WelsDec {
 
@@ -67,13 +67,13 @@ static int32_t CreatePicBuff (PWelsDecoderContext pCtx, PPicBuff* ppPicBuf, cons
     return 1;
   }
 
-  pPicBuf	= (PPicBuff)WelsMalloc (sizeof (SPicBuff), "PPicBuff");
+  pPicBuf	= (PPicBuff)WelsMallocz (sizeof (SPicBuff), "PPicBuff");
 
   if (NULL == pPicBuf) {
     return 1;
   }
 
-  pPicBuf->ppPic = (PPicture*)WelsMalloc (kiSize * sizeof (PPicture), "PPicture*");
+  pPicBuf->ppPic = (PPicture*)WelsMallocz (kiSize * sizeof (PPicture), "PPicture*");
 
   if (NULL == pPicBuf->ppPic) {
     pPicBuf->iCapacity = 0;
@@ -109,13 +109,13 @@ static int32_t IncreasePicBuff (PWelsDecoderContext pCtx, PPicBuff* ppPicBuf, co
     return 1;
   }
 
-  pPicNewBuf	= (PPicBuff)WelsMalloc (sizeof (SPicBuff), "PPicBuff");
+  pPicNewBuf	= (PPicBuff)WelsMallocz (sizeof (SPicBuff), "PPicBuff");
 
   if (NULL == pPicNewBuf) {
     return 1;
   }
 
-  pPicNewBuf->ppPic = (PPicture*)WelsMalloc (kiNewSize * sizeof (PPicture), "PPicture*");
+  pPicNewBuf->ppPic = (PPicture*)WelsMallocz (kiNewSize * sizeof (PPicture), "PPicture*");
 
   if (NULL == pPicNewBuf->ppPic) {
     pPicNewBuf->iCapacity = 0;
@@ -171,13 +171,13 @@ static int32_t DecreasePicBuff (PWelsDecoderContext pCtx, PPicBuff* ppPicBuf, co
     return 1;
   }
 
-  pPicNewBuf	= (PPicBuff)WelsMalloc (sizeof (SPicBuff), "PPicBuff");
+  pPicNewBuf	= (PPicBuff)WelsMallocz (sizeof (SPicBuff), "PPicBuff");
 
   if (NULL == pPicNewBuf) {
     return 1;
   }
 
-  pPicNewBuf->ppPic = (PPicture*)WelsMalloc (kiNewSize * sizeof (PPicture), "PPicture*");
+  pPicNewBuf->ppPic = (PPicture*)WelsMallocz (kiNewSize * sizeof (PPicture), "PPicture*");
 
   if (NULL == pPicNewBuf->ppPic) {
     pPicNewBuf->iCapacity	 = 0;
@@ -311,7 +311,15 @@ void WelsDecoderDefaults (PWelsDecoderContext pCtx, SLogContext* pLogCtx) {
   pCtx->sDecoderStatistics.iAvgLumaQp = -1;
   pCtx->bSpsLatePps = false;
   pCtx->bUseScalingList = false;
-
+  pCtx->iSpsErrorIgnored = 0;
+  pCtx->iSubSpsErrorIgnored = 0;
+  pCtx->iPpsErrorIgnored = 0;
+  pCtx->iPPSInvalidNum = 0;
+  pCtx->iPPSLastInvalidId = -1;
+  pCtx->iSPSInvalidNum = 0;
+  pCtx->iSPSLastInvalidId = -1;
+  pCtx->iSubSPSInvalidNum = 0;
+  pCtx->iSubSPSLastInvalidId = -1;
 }
 
 /*
@@ -417,7 +425,7 @@ int32_t WelsRequestMem (PWelsDecoderContext pCtx, const int32_t kiMbWidth, const
   pCtx->pDec		        = NULL;			// need prefetch a new pic due to spatial size changed
 
   if (pCtx->pCabacDecEngine == NULL)
-    pCtx->pCabacDecEngine = (SWelsCabacDecEngine*) WelsMalloc (sizeof (SWelsCabacDecEngine), "pCtx->pCabacDecEngine");
+    pCtx->pCabacDecEngine = (SWelsCabacDecEngine*) WelsMallocz (sizeof (SWelsCabacDecEngine), "pCtx->pCabacDecEngine");
 
   return ERR_NONE;
 }
@@ -459,7 +467,6 @@ int32_t WelsOpenDecoder (PWelsDecoderContext pCtx) {
   //initial MC function pointer--
   int iRet = ERR_NONE;
   InitMcFunc (& (pCtx->sMcFunc), pCtx->uiCpuFlag);
-  InitErrorCon (pCtx);
 
   InitExpandPictureFunc (& (pCtx->sExpandPicFunc), pCtx->uiCpuFlag);
   AssignFuncPointerForRec (pCtx);
@@ -509,7 +516,7 @@ int32_t DecoderConfigParam (PWelsDecoderContext pCtx, const SDecodingParam* kpPa
   if (NULL == pCtx || NULL == kpParam)
     return 1;
 
-  pCtx->pParam	= (SDecodingParam*)WelsMalloc (sizeof (SDecodingParam), "SDecodingParam");
+  pCtx->pParam	= (SDecodingParam*)WelsMallocz (sizeof (SDecodingParam), "SDecodingParam");
 
   if (NULL == pCtx->pParam)
     return 1;
@@ -525,6 +532,7 @@ int32_t DecoderConfigParam (PWelsDecoderContext pCtx, const SDecodingParam* kpPa
 
   if (pCtx->bParseOnly) //parse only, disable EC method
     pCtx->eErrorConMethod = ERROR_CON_DISABLE;
+  InitErrorCon (pCtx);
 
   if (VIDEO_BITSTREAM_SVC == pCtx->pParam->sVideoProperty.eVideoBsType ||
       VIDEO_BITSTREAM_AVC == pCtx->pParam->sVideoProperty.eVideoBsType) {
@@ -661,25 +669,24 @@ int32_t WelsDecodeBs (PWelsDecoderContext pCtx, const uint8_t* kpBsBuf, const in
                                0; // set 4 reserved bytes to zero
           pNalPayload	= ParseNalHeader (pCtx, &pCtx->sCurNalHead, pDstNal, iDstIdx, pSrcNal - 3, iSrcIdx + 3, &iConsumedBytes);
           if (pNalPayload) { //parse correct
-            if (IS_VCL_NAL (pCtx->sCurNalHead.eNalUnitType, 1)) {
-              CheckAndFinishLastPic (pCtx, ppDst, pDstBufInfo);
-            }
             if (IS_PARAM_SETS_NALS (pCtx->sCurNalHead.eNalUnitType)) {
               iRet = ParseNonVclNal (pCtx, pNalPayload, iDstIdx - iConsumedBytes, pSrcNal - 3, iSrcIdx + 3);
             }
-            if (pCtx->bAuReadyFlag) {
+            CheckAndFinishLastPic (pCtx, ppDst, pDstBufInfo);
+            if (pCtx->bAuReadyFlag && pCtx->pAccessUnitList->uiAvailUnitsNum != 0) {
               ConstructAccessUnit (pCtx, ppDst, pDstBufInfo);
+            }
+          }
+          DecodeFinishUpdate (pCtx);
 
-              if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
+          if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
 #ifdef LONG_TERM_REF
-                pCtx->bParamSetsLostFlag = true;
+            pCtx->bParamSetsLostFlag = true;
 #else
-                pCtx->bReferenceLostAtT0Flag = true;
+            pCtx->bReferenceLostAtT0Flag = true;
 #endif
-                if (dsOutOfMemory & pCtx->iErrorCode) {
-                  return pCtx->iErrorCode;
-                }
-              }
+            if (dsOutOfMemory & pCtx->iErrorCode) {
+              return pCtx->iErrorCode;
             }
           }
           if (iRet) {
@@ -717,26 +724,26 @@ int32_t WelsDecodeBs (PWelsDecoderContext pCtx, const uint8_t* kpBsBuf, const in
     iConsumedBytes = 0;
     pDstNal[iDstIdx] = pDstNal[iDstIdx + 1] = pDstNal[iDstIdx + 2] = pDstNal[iDstIdx + 3] =
                          0; // set 4 reserved bytes to zero
+    pRawData->pCurPos = pDstNal + iDstIdx + 4; //init, increase 4 reserved zero bytes, used to store the next NAL
     pNalPayload = ParseNalHeader (pCtx, &pCtx->sCurNalHead, pDstNal, iDstIdx, pSrcNal - 3, iSrcIdx + 3, &iConsumedBytes);
     if (pNalPayload) { //parse correct
-      if (IS_VCL_NAL (pCtx->sCurNalHead.eNalUnitType, 1)) {
-        CheckAndFinishLastPic (pCtx, ppDst, pDstBufInfo);
-      }
       if (IS_PARAM_SETS_NALS (pCtx->sCurNalHead.eNalUnitType)) {
         iRet = ParseNonVclNal (pCtx, pNalPayload, iDstIdx - iConsumedBytes, pSrcNal - 3, iSrcIdx + 3);
       }
-      if (pCtx->bAuReadyFlag) {
+      CheckAndFinishLastPic (pCtx, ppDst, pDstBufInfo);
+      if (pCtx->bAuReadyFlag && pCtx->pAccessUnitList->uiAvailUnitsNum != 0) {
         ConstructAccessUnit (pCtx, ppDst, pDstBufInfo);
-
-        if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
-#ifdef LONG_TERM_REF
-          pCtx->bParamSetsLostFlag = true;
-#else
-          pCtx->bReferenceLostAtT0Flag = true;
-#endif
-          return pCtx->iErrorCode;
-        }
       }
+    }
+    DecodeFinishUpdate (pCtx);
+
+    if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
+#ifdef LONG_TERM_REF
+      pCtx->bParamSetsLostFlag = true;
+#else
+      pCtx->bReferenceLostAtT0Flag = true;
+#endif
+      return pCtx->iErrorCode;
     }
     if (iRet) {
       iRet = 0;
@@ -749,7 +756,6 @@ int32_t WelsDecodeBs (PWelsDecoderContext pCtx, const uint8_t* kpBsBuf, const in
       }
       return pCtx->iErrorCode;
     }
-    pRawData->pCurPos = pDstNal + iDstIdx + 4; //init, increase 4 reserved zero bytes, used to store the next NAL
   } else { /* no supplementary picture payload input, but stored a picture */
     PAccessUnit pCurAu	=
       pCtx->pAccessUnitList;	// current access unit, it will never point to NULL after decode's successful initialization
@@ -760,15 +766,16 @@ int32_t WelsDecodeBs (PWelsDecoderContext pCtx, const uint8_t* kpBsBuf, const in
       pCtx->pAccessUnitList->uiEndPos = pCtx->pAccessUnitList->uiAvailUnitsNum - 1;
 
       ConstructAccessUnit (pCtx, ppDst, pDstBufInfo);
+    }
+    DecodeFinishUpdate (pCtx);
 
-      if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
+    if ((dsOutOfMemory | dsNoParamSets) & pCtx->iErrorCode) {
 #ifdef LONG_TERM_REF
-        pCtx->bParamSetsLostFlag = true;
+      pCtx->bParamSetsLostFlag = true;
 #else
-        pCtx->bReferenceLostAtT0Flag = true;
+      pCtx->bReferenceLostAtT0Flag = true;
 #endif
-        return pCtx->iErrorCode;
-      }
+      return pCtx->iErrorCode;
     }
   }
 
@@ -993,8 +1000,8 @@ void UpdateDecStatNoFreezingInfo (PWelsDecoderContext pCtx) {
     ResetDecStatNums (pDecStat);
     pDecStat->iAvgLumaQp = iTotalQp;
   } else
-    pDecStat->iAvgLumaQp = (uint64_t) (pDecStat->iAvgLumaQp * pDecStat->uiDecodedFrameCount + iTotalQp) /
-                           (pDecStat->uiDecodedFrameCount + 1);
+    pDecStat->iAvgLumaQp = (int) ((uint64_t) (pDecStat->iAvgLumaQp * pDecStat->uiDecodedFrameCount + iTotalQp) /
+                                  (pDecStat->uiDecodedFrameCount + 1));
 
   //update IDR number
   if (pCurDq->sLayerInfo.sNalHeaderExt.bIdrFlag) {

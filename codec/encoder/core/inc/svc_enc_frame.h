@@ -42,7 +42,6 @@
 #include "slice.h"
 #include "picture.h"
 #include "svc_enc_macroblock.h"
-#include "bit_stream.h"
 
 
 #include "svc_enc_slice_segment.h"
@@ -93,6 +92,8 @@ int16_t					iMbWidth;		// MB width of this picture, equal to pSps.iMbWidth
 int16_t					iMbHeight;		// MB height of this picture, equal to pSps.iMbHeight;
 
 bool					bBaseLayerAvailableFlag;	// whether base layer is available for prediction?
+bool					bSatdInMdFlag; // whether SATD is calculated in ME and integer-pel MD
+
 uint8_t					iLoopFilterDisableIdc;	// 0: on, 1: off, 2: on except for slice boundaries
 int8_t					iLoopFilterAlphaC0Offset;// AlphaOffset: valid range [-6, 6], default 0
 int8_t					iLoopFilterBetaOffset;	// BetaOffset:	valid range [-6, 6], default 0

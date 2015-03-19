@@ -48,6 +48,7 @@
 #include "mc.h"
 #include "sample.h"
 
+#include "svc_enc_golomb.h"
 #include "svc_base_layer_md.h"
 #include "svc_mode_decision.h"
 #include "set_mb_syn_cavlc.h"
@@ -209,7 +210,7 @@ int32_t InitFunctionPointers (sWelsEncCtx* pEncCtx, SWelsSvcCodingParam* pParam,
   /* Motion compensation */
   /*init pixel average function*/
   /*get one column or row pixel when refinement*/
-  WelsInitMcFuncs (pFuncList, uiCpuFlag);
+  InitMcFunc (&pFuncList->sMcFuncs, uiCpuFlag);
   InitCoeffFunc (pFuncList,uiCpuFlag,pParam->iEntropyCodingModeFlag);
 
   WelsInitEncodingFuncs (pFuncList, uiCpuFlag);

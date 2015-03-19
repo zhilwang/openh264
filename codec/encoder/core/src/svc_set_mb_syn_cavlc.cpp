@@ -209,10 +209,10 @@ void WelsSpatialWriteSubMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurM
 }
 
 int32_t CheckBitstreamBuffer (const uint32_t	kuiSliceIdx, sWelsEncCtx* pEncCtx,  SBitStringAux* pBs) {
-  const intX_t iLeftLength = pBs->pBufEnd - pBs->pBufPtr - 1;
+  const intX_t iLeftLength = pBs->pEndBuf - pBs->pCurBuf - 1;
   assert (iLeftLength > 0);
 
-  if (iLeftLength < MAX_MACROBLOCK_SIZE_IN_BYTE) {
+  if (iLeftLength < MAX_MACROBLOCK_SIZE_IN_BYTE_x2) {
     return ENC_RETURN_MEMALLOCERR;
     //TODO: call the realloc&copy instead
   }

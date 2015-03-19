@@ -531,15 +531,14 @@ typedef struct TagQuarParams {
 
 inline void MeRefineQuarPixel (SWelsFuncPtrList* pFunc, SWelsME* pMe, SMeRefinePointer* pMeRefine,
                                const int32_t kiWidth, const int32_t kiHeight, SQuarRefineParams* pParams, int32_t iStrideEnc) {
-  PWelsSampleAveragingFunc* pSampleAvg	= pFunc->sMcFuncs.pfSampleAveraging;
-  const int32_t kiAvgIndex		= kiWidth >> 4;
+  PWelsSampleAveragingFunc pSampleAvg	= pFunc->sMcFuncs.pfSampleAveraging;
   int32_t iCurCost;
   uint8_t* pEncMb				= pMe->pEncMb;
   uint8_t* pTmp				= NULL;
   const uint8_t kuiPixel		= pMe->uiBlockSize;
 
-  pSampleAvg[kiAvgIndex] (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[0], ME_REFINE_BUF_STRIDE,
-                          pParams->pSrcB[0], pParams->iStrideA, kiHeight);
+  pSampleAvg (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[0], ME_REFINE_BUF_STRIDE,
+              pParams->pSrcB[0], pParams->iStrideA, kiWidth, kiHeight);
 
   iCurCost = CALC_COST (pMeRefine->pQuarPixTmp, pParams->iLms[0]);
   if (iCurCost < pParams->iBestCost) {
@@ -547,24 +546,24 @@ inline void MeRefineQuarPixel (SWelsFuncPtrList* pFunc, SWelsME* pMe, SMeRefineP
     SWITCH_BEST_TMP_BUF (pMeRefine->pQuarPixBest, pMeRefine->pQuarPixTmp);
   }
   //=========================(0, 1)=======================//
-  pSampleAvg[kiAvgIndex] (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[1],
-                          ME_REFINE_BUF_STRIDE, pParams->pSrcB[1], pParams->iStrideA, kiHeight);
+  pSampleAvg (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[1],
+              ME_REFINE_BUF_STRIDE, pParams->pSrcB[1], pParams->iStrideA, kiWidth, kiHeight);
   iCurCost = CALC_COST (pMeRefine->pQuarPixTmp, pParams->iLms[1]);
   if (iCurCost < pParams->iBestCost) {
     pParams->iBestQuarPix = ME_QUAR_PIXEL_BOTTOM;
     SWITCH_BEST_TMP_BUF (pMeRefine->pQuarPixBest, pMeRefine->pQuarPixTmp);
   }
   //==========================(-1, 0)=========================//
-  pSampleAvg[kiAvgIndex] (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[2],
-                          ME_REFINE_BUF_STRIDE, pParams->pSrcB[2], pParams->iStrideB, kiHeight);
+  pSampleAvg (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[2],
+              ME_REFINE_BUF_STRIDE, pParams->pSrcB[2], pParams->iStrideB, kiWidth, kiHeight);
   iCurCost = CALC_COST (pMeRefine->pQuarPixTmp, pParams->iLms[2]);
   if (iCurCost < pParams->iBestCost) {
     pParams->iBestQuarPix = ME_QUAR_PIXEL_LEFT;
     SWITCH_BEST_TMP_BUF (pMeRefine->pQuarPixBest, pMeRefine->pQuarPixTmp);
   }
   //==========================(1, 0)=========================//
-  pSampleAvg[kiAvgIndex] (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[3],
-                          ME_REFINE_BUF_STRIDE,	pParams->pSrcB[3], pParams->iStrideB,  kiHeight);
+  pSampleAvg (pMeRefine->pQuarPixTmp, ME_REFINE_BUF_STRIDE, pParams->pSrcA[3],
+              ME_REFINE_BUF_STRIDE,	pParams->pSrcB[3], pParams->iStrideB,  kiWidth, kiHeight);
 
   iCurCost = CALC_COST (pMeRefine->pQuarPixTmp, pParams->iLms[3]);
   if (iCurCost < pParams->iBestCost) {
@@ -599,8 +598,7 @@ void MeRefineFracPixel (sWelsEncCtx* pEncCtx, uint8_t* pMemPredInterMb, SWelsME*
   int32_t iCurCost;
   int32_t iBestHalfPix;
 
-  if ((pFunc->sSampleDealingFuncs.pfMeCost == pFunc->sSampleDealingFuncs.pfSampleSatd)
-      && (pFunc->sSampleDealingFuncs.pfMdCost == pFunc->sSampleDealingFuncs.pfSampleSatd)) {
+  if (pEncCtx->pCurDqLayer->bSatdInMdFlag) {
     iBestCost = pMe->uSadPredISatd.uiSatd + COST_MVD (pMe->pMvdCost, iMvx - pMe->sMvp.iMvX, iMvy - pMe->sMvp.iMvY);
   } else {
     iBestCost = pFunc->sSampleDealingFuncs.pfMeCost[pMe->uiBlockSize] (pEncData, kiStrideEnc, pRef, kiStrideRef) +
@@ -766,17 +764,8 @@ void MeRefineFracPixel (sWelsEncCtx* pEncCtx, uint8_t* pMemPredInterMb, SWelsME*
     pBestPredInter = pRef;
     iInterBlk4Stride = kiStrideRef;
   }
-  if (MB_WIDTH_LUMA == iWidth && MB_HEIGHT_LUMA == iHeight) { //P16x16
-    pFunc->pfCopy16x16NotAligned (pMemPredInterMb, MB_WIDTH_LUMA, pBestPredInter,
-                                  iInterBlk4Stride);	// dst can be align with 16 bytes, but not sure at pSrc, 12/29/2011
-  } else if (MB_WIDTH_LUMA == iWidth && MB_HEIGHT_CHROMA == iHeight) { //P16x8
-    pFunc->pfCopy16x8NotAligned (pMemPredInterMb, MB_WIDTH_LUMA, pBestPredInter,
-                                 iInterBlk4Stride);	// dst can be align with 16 bytes, but not sure at pSrc, 12/29/2011
-  } else if (MB_WIDTH_CHROMA == iWidth && MB_HEIGHT_LUMA == iHeight) { //P8x16
-    pFunc->pfCopy8x16Aligned (pMemPredInterMb, MB_WIDTH_LUMA, pBestPredInter, iInterBlk4Stride);
-  } else { //P8x8
-    pFunc->pfCopy8x8Aligned (pMemPredInterMb, MB_WIDTH_LUMA, pBestPredInter, iInterBlk4Stride);
-  }
+  pMeRefine->pfCopyBlockByMode (pMemPredInterMb, MB_WIDTH_LUMA, pBestPredInter,
+                                iInterBlk4Stride);
 }
 
 void InitBlkStrideWithRef (int32_t* pBlkStride, const int32_t kiStrideRef) {
