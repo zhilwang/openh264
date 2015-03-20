@@ -58,6 +58,7 @@ void WelsI4x4LumaPredV_c (uint8_t* pPred, const int32_t kiStride) {
   ST32A4 (pPred + kiStride				, kuiVal);
   ST32A4 (pPred + (kiStride << 1)			, kuiVal);
   ST32A4 (pPred + (kiStride << 1) + kiStride	, kuiVal);
+    aa
 }
 
 void WelsI4x4LumaPredH_c (uint8_t* pPred, const int32_t kiStride) {
