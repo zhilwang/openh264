@@ -4,6 +4,7 @@ compiler:
   - clang
 
 before_install:
+  - sysctl -a | grep machdep.cpu
   - brew update
   - brew install nasm
 
