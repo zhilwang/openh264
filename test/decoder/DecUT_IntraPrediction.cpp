@@ -10,7 +10,7 @@ using namespace WelsDec;
 #define GENERATE_4x4_UT(pred, ref, ASM, CPUFLAGS) \
   TEST(DecoderIntraPredictionTest, pred) { \
   const int32_t kiStride = 32; \
-  int32_t iRunTimes = 1000; \
+  int32_t iRunTimes = 1; \
   ENFORCE_STACK_ALIGN_1D (uint8_t, pPredBuffer, 12 * kiStride, 4); \
   ENFORCE_STACK_ALIGN_1D (uint8_t, pRefBuffer, 12 * kiStride, 4); \
 if (ASM) {\
@@ -379,7 +379,7 @@ GENERATE_4x4_UT (WelsI4x4LumaPredHD_c, WelsI4x4LumaPredHD_ref, 0, 0)
 #define GENERATE_8x8_UT(pred, ref, ASM, CPUFLAGS) \
 TEST(DecoderIntraPredictionTest, pred) {\
 const int32_t kiStride = 32; \
-int iRunTimes = 1000; \
+int iRunTimes = 1; \
 ENFORCE_STACK_ALIGN_1D (uint8_t, pRefBuffer, 18 * kiStride, 16); \
 ENFORCE_STACK_ALIGN_1D (uint8_t, pPredBuffer, 18 * kiStride, 16); \
 if (ASM) { \
@@ -516,7 +516,7 @@ GENERATE_8x8_UT (WelsIChromaPredV_c, LumaI8x8PredV, 0, 0)
 #define GENERATE_16x16_UT(pred, ref, ASM, CPUFLAGS) \
 TEST(DecoderIntraPredictionTest, pred) {\
 const int32_t kiStride = 32; \
-int32_t iRunTimes = 1000; \
+int32_t iRunTimes = 10; \
 ENFORCE_STACK_ALIGN_1D (uint8_t, pRefBuffer, 18 * kiStride, 16); \
 ENFORCE_STACK_ALIGN_1D (uint8_t, pPredBuffer, 18 * kiStride, 16); \
 if (ASM) { \
