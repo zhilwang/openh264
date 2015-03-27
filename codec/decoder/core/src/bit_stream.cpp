@@ -38,41 +38,9 @@
  *************************************************************************************
  */
 #include "bit_stream.h"
-#include "macros.h"
+#include "error_code.h"
 
 namespace WelsDec {
-
-#ifdef WORDS_BIGENDIAN
-inline uint32_t EndianFix (uint32_t uiX) {
-  return uiX;
-}
-#else //WORDS_BIGENDIAN
-
-#ifdef WIN32
-inline uint32_t EndianFix (uint32_t uiX) {
-  __asm {
-    mov   eax,  uiX
-    bswap   eax
-    mov   uiX,    eax
-  }
-  return uiX;
-}
-#else  //_MSC_VER
-
-inline uint32_t EndianFix (uint32_t uiX) {
-#ifdef ARM_ARCHv7
-  __asm__ __volatile__ ("rev %0, %0":"+r" (uiX)); //Just for the ARMv7
-#elif defined (X86_ARCH)
-  __asm__ __volatile__ ("bswap %0":"+r" (uiX));
-#else
-  uiX = ((uiX & 0xff000000) >> 24) | ((uiX & 0xff0000) >> 8) |
-        ((uiX & 0xff00) << 8) | ((uiX & 0xff) << 24);
-#endif
-  return uiX;
-}
-#endif //_MSC_VER
-
-#endif //WORDS_BIGENDIAN
 
 inline uint32_t GetValue4Bytes (uint8_t* pDstNal) {
   uint32_t uiValue = 0;
@@ -80,10 +48,14 @@ inline uint32_t GetValue4Bytes (uint8_t* pDstNal) {
   return uiValue;
 }
 
-void_t InitReadBits (PBitStringAux pBitString) {
+int32_t InitReadBits (PBitStringAux pBitString, intX_t iEndOffset) {
+  if (pBitString->pCurBuf >= (pBitString->pEndBuf - iEndOffset)) {
+    return ERR_INFO_INVALID_ACCESS;
+  }
   pBitString->uiCurBits  = GetValue4Bytes (pBitString->pCurBuf);
   pBitString->pCurBuf  += 4;
   pBitString->iLeftBits = -16;
+  return ERR_NONE;
 }
 
 /*!
@@ -93,23 +65,45 @@ void_t InitReadBits (PBitStringAux pBitString) {
  * \param	kpBuf		bit-stream buffer
  * \param	kiSize	    size in bits for decoder; size in bytes for encoder
  *
- * \return	size of buffer data in byte; failed in -1 return
+ * \return	0: success, other: fail
  */
-int32_t InitBits (PBitStringAux pBitString, const uint8_t* kpBuf, const int32_t kiSize) {
+int32_t DecInitBits (PBitStringAux pBitString, const uint8_t* kpBuf, const int32_t kiSize) {
   const int32_t kiSizeBuf = (kiSize + 7) >> 3;
   uint8_t* pTmp = (uint8_t*)kpBuf;
 
   if (NULL == pTmp)
-    return -1;
+    return ERR_INFO_INVALID_ACCESS;
 
   pBitString->pStartBuf   = pTmp;				// buffer to start position
   pBitString->pEndBuf	    = pTmp + kiSizeBuf;	// buffer + length
   pBitString->iBits	    = kiSize;				// count bits of overall bitstreaming inputindex;
-
   pBitString->pCurBuf   = pBitString->pStartBuf;
-  InitReadBits (pBitString);
+  int32_t iErr = InitReadBits (pBitString, 0);
+  if (iErr) {
+    return iErr;
+  }
+  return ERR_NONE;
+}
 
-  return kiSizeBuf;
+void RBSP2EBSP (uint8_t* pDstBuf, uint8_t* pSrcBuf, const int32_t kiSize) {
+  uint8_t* pSrcPointer = pSrcBuf;
+  uint8_t* pDstPointer = pDstBuf;
+  uint8_t* pSrcEnd = pSrcBuf + kiSize;
+  int32_t iZeroCount = 0;
+
+  while (pSrcPointer < pSrcEnd) {
+    if (iZeroCount == 2 && *pSrcPointer <= 3) {
+      //add the code 0x03
+      *pDstPointer++ = 3;
+      iZeroCount = 0;
+    }
+    if (*pSrcPointer == 0) {
+      ++ iZeroCount;
+    } else {
+      iZeroCount = 0;
+    }
+    *pDstPointer++ = *pSrcPointer++;
+  }
 }
 
 } // namespace WelsDec

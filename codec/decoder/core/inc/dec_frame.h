@@ -61,21 +61,23 @@ typedef struct TagLayerInfo {
 struct TagDqLayer {
   SLayerInfo			sLayerInfo;
 
-  uint8_t*				pCsData[3];	// pointer to reconstructed picture data
-  int32_t				iCsStride[3];	// Cs stride
   PBitStringAux		pBitStringAux;	// pointer to SBitStringAux
   PFmo				pFmo;		// Current fmo context pointer used
-  int8_t*  pMbType;
+  int16_t*  pMbType;
   int32_t* pSliceIdc;				// using int32_t for slice_idc
   int16_t	(*pMv[LIST_A])[MB_BLOCK4x4_NUM][MV_A];
+  int16_t	(*pMvd[LIST_A])[MB_BLOCK4x4_NUM][MV_A];
   int8_t	(*pRefIndex[LIST_A])[MB_BLOCK4x4_NUM];
   int8_t*  pLumaQp;
-  int8_t*  pChromaQp;
+  int8_t  (*pChromaQp)[2];
   int8_t*  pCbp;
+  uint8_t *pCbfDc;
   int8_t (*pNzc)[24];
   int8_t (*pNzcRs)[24];
   int8_t*  pResidualPredFlag;
   int8_t*  pInterPredictionDoneFlag;
+  bool*    pMbCorrectlyDecodedFlag;
+  bool*    pMbRefConcealedFlag;
   int16_t (*pScaledTCoeff)[MB_COEFF_LIST_SIZE];
   int8_t (*pIntraPredMode)[8];  //0~3 top4x4 ; 4~6 left 4x4; 7 intra16x16
   int8_t (*pIntra4x4FinalMode)[MB_BLOCK4x4_NUM];
@@ -100,28 +102,31 @@ struct TagDqLayer {
   int32_t					iInterLayerSliceBetaOffset;
   //SPosOffset			sScaledRefLayer;
   int32_t					iSliceGroupChangeCycle;
+  
   PRefPicListReorderSyn	pRefPicListReordering;
+  PPredWeightTabSyn     pPredWeightTable;
   PRefPicMarking          pRefPicMarking; // Decoded reference picture marking syntaxs
   PRefBasePicMarking	    pRefPicBaseMarking;
 
   PPicture				pRef;			// reference picture pointer
   PPicture				pDec;			// reconstruction picture pointer for layer
 
-  bool_t					bStoreRefBasePicFlag;				// iCurTid == 0 && iCurQid = 0 && bEncodeKeyPic = 1
-  bool_t					bTCoeffLevelPredFlag;
-  bool_t					bConstrainedIntraResamplingFlag;
+    bool    bUseWeightPredictionFlag;
+  bool					bStoreRefBasePicFlag;				// iCurTid == 0 && iCurQid = 0 && bEncodeKeyPic = 1
+  bool					bTCoeffLevelPredFlag;
+  bool					bConstrainedIntraResamplingFlag;
   uint8_t					uiRefLayerDqId;
   uint8_t					uiRefLayerChromaPhaseXPlus1Flag;
   uint8_t					uiRefLayerChromaPhaseYPlus1;
   uint8_t					uiLayerDqId;			// dq_id of current layer
-  bool_t					bUseRefBasePicFlag;	// whether reference pic or reference base pic is referred?
+  bool					bUseRefBasePicFlag;	// whether reference pic or reference base pic is referred?
 };
 
 typedef struct TagGpuAvcLayer {
   SLayerInfo				sLayerInfo;
   PBitStringAux			pBitStringAux;	// pointer to SBitStringAux
 
-  int8_t*					pMbType;
+  int16_t*					pMbType;
   int32_t*					pSliceIdc;	// using int32_t for slice_idc
   int8_t*					pLumaQp;
   int8_t*					pCbp;

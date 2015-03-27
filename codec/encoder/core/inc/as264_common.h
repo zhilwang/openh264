@@ -38,8 +38,8 @@
  *************************************************************************************
  */
 
-#ifndef _AS264_COMMON_H_
-#define _AS264_COMMON_H_
+#ifndef AS264_COMMON_H_
+#define AS264_COMMON_H_
 
 /* debug setting for console
 $(TargetPath)
@@ -50,7 +50,7 @@ $(TargetPath)
 /****************************************************************************
  * Options for algorithm, usually change bitrate
  ****************************************************************************/
-#define DISABLE_FMO_FEATURE	// 
+#define DISABLE_FMO_FEATURE	//
 
 /****************************************************************************
  * Options for optimization, not change bitrate
@@ -139,22 +139,5 @@ $(TargetPath)
 #endif//MB_TYPES_CHECK
 #endif//MB_TYPES_INFO_OUTPUT
 
-// NOTE: please do not clean below lines even comment, turn on for potential memory leak verify and memory usage monitor etc.
-//#define MEMORY_CHECK
-#define MEMORY_MONITOR
-#ifdef MEMORY_CHECK
-#ifndef MEMORY_MONITOR
-#define MEMORY_MONITOR
-#endif//MEMORY_MONITOR
-#endif//MEMORY_CHECK
-
-//#define ENABLE_TRACE_FILE
-#if defined(_WIN32) && defined(_DEBUG)
-#ifdef ENABLE_TRACE_FILE
-#undef ENABLE_TRACE_FILE
-#endif//ENABLE_TRACE_FILE
-#endif//_WIN32 & _DEBUG
-
-
-#endif // _AS264_COMMON_H_
+#endif // AS264_COMMON_H_
 

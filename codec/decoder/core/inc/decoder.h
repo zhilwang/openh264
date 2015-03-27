@@ -52,7 +52,7 @@ extern "C" {
 /*!
  * \brief	configure decoder parameters
  */
-int32_t DecoderConfigParam (PWelsDecoderContext pCtx, const void_t* kpParam);
+int32_t DecoderConfigParam (PWelsDecoderContext pCtx, const SDecodingParam* kpParam);
 
 /*!
  *************************************************************************************
@@ -68,7 +68,7 @@ int32_t DecoderConfigParam (PWelsDecoderContext pCtx, const void_t* kpParam);
  * \note	N/A
  *************************************************************************************
  */
-int32_t WelsInitDecoder (PWelsDecoderContext pCtx,  void_t* pTraceHandle, PWelsLogCallbackFunc pLog);
+int32_t WelsInitDecoder (PWelsDecoderContext pCtx, const bool bParseOnly, SLogContext* pLogCtx);
 
 /*!
  *************************************************************************************
@@ -81,7 +81,7 @@ int32_t WelsInitDecoder (PWelsDecoderContext pCtx,  void_t* pTraceHandle, PWelsL
  * \note	N/A
  *************************************************************************************
  */
-void_t WelsEndDecoder (PWelsDecoderContext pCtx);
+void WelsEndDecoder (PWelsDecoderContext pCtx);
 
 /*!
  *************************************************************************************
@@ -101,7 +101,7 @@ void_t WelsEndDecoder (PWelsDecoderContext pCtx);
  */
 
 int32_t WelsDecodeBs (PWelsDecoderContext pCtx, const uint8_t* kpBsBuf, const int32_t kiBsLen,
-                      uint8_t** ppDst, SBufferInfo* pDstBufInfo);
+                      uint8_t** ppDst, SBufferInfo* pDstBufInfo, SParserBsInfo* pDstBsInfo);
 
 /*
  *	request memory blocks for decoder avc part
@@ -112,7 +112,7 @@ int32_t WelsRequestMem (PWelsDecoderContext pCtx, const int32_t kiMbWidth, const
 /*
  *	free memory blocks in avc
  */
-void_t WelsFreeMem (PWelsDecoderContext pCtx);
+void WelsFreeMem (PWelsDecoderContext pCtx);
 
 /*
  * set colorspace format in decoder
@@ -130,18 +130,21 @@ int32_t DecoderSetCsp (PWelsDecoderContext pCtx, const int32_t kiColorFormat);
  */
 int32_t SyncPictureResolutionExt (PWelsDecoderContext pCtx, const int32_t kiMbWidth, const int32_t kiMbHeight);
 
-/*!
- * \brief	update maximal picture width and height if applicable when receiving a SPS NAL
- */
-void_t UpdateMaxPictureResolution (PWelsDecoderContext pCtx, const int32_t kiCurWidth, const int32_t kiCurHeight);
+void AssignFuncPointerForRec (PWelsDecoderContext pCtx);
 
-void_t AssignFuncPointerForRec (PWelsDecoderContext pCtx);
-
-void_t ResetParameterSetsState (PWelsDecoderContext pCtx);
-
-void_t GetVclNalTemporalId (PWelsDecoderContext pCtx); //get the info that whether or not have VCL NAL in current AU,
+void GetVclNalTemporalId (PWelsDecoderContext pCtx); //get the info that whether or not have VCL NAL in current AU,
 //and if YES, get the temporal ID
 
+//reset decoder number related statistics info
+void ResetDecStatNums (SDecoderStatistics* pDecStat);
+//update information when freezing occurs, including IDR/non-IDR number
+void UpdateDecStatFreezingInfo (const bool kbIdrFlag, SDecoderStatistics* pDecStat);
+//update information when no freezing occurs, including QP, correct IDR number, ECed IDR number
+void UpdateDecStatNoFreezingInfo (PWelsDecoderContext pCtx);
+//update decoder statistics information
+void UpdateDecStat (PWelsDecoderContext pCtx, const bool kbOutput);
+//Destroy picutre buffer
+void DestroyPicBuff (PPicBuff* ppPicBuf);
 #ifdef __cplusplus
 }
 #endif//__cplusplus

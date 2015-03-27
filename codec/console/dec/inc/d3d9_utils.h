@@ -43,13 +43,18 @@
 #ifndef WELS_D3D9_UTILS_H__
 #define WELS_D3D9_UTILS_H__
 
-//#pragma once	// do not use this due cross platform, esp for Solaris
-
 #include <stdio.h>
 #include "codec_def.h"
 
 #if defined(_MSC_VER) && (_MSC_VER>=1500) // vs2008 and upper
-#define ENABLE_DISPLAY_MODULE // enable/disable the render feature 
+#ifdef WINAPI_FAMILY
+#include <winapifamily.h>
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+#define ENABLE_DISPLAY_MODULE // enable/disable the render feature
+#endif
+#else /* defined(WINAPI_FAMILY) */
+#define ENABLE_DISPLAY_MODULE // enable/disable the render feature
+#endif
 #endif
 
 #ifdef ENABLE_DISPLAY_MODULE
@@ -77,6 +82,8 @@ class CD3D9Utils {
   HWND                  m_hWnd;
   unsigned char*        m_pDumpYUV;
   BOOL                  m_bInitDone;
+  int                   m_nWidth;
+  int                   m_nHeight;
 
   LPDIRECT3D9           m_lpD3D9;
   LPDIRECT3DDEVICE9     m_lpD3D9Device;
@@ -105,6 +112,8 @@ class CD3D9ExUtils {
   HWND                  m_hWnd;
   unsigned char*        m_pDumpYUV;
   BOOL                  m_bInitDone;
+  int                   m_nWidth;
+  int                   m_nHeight;
 
   LPDIRECT3D9EX         m_lpD3D9;
   LPDIRECT3DDEVICE9EX   m_lpD3D9Device;

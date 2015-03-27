@@ -39,8 +39,7 @@
  *
  *****************************************************************************/
 #include "memmgr_nal_unit.h"
-#include "utils.h"
-#include "mem_align.h"
+#include "memory_align.h"
 
 namespace WelsDec {
 
@@ -59,7 +58,7 @@ int32_t MemInitNalList (PAccessUnit* ppAu, const uint32_t kuiSize) {
     MemFreeNalList (ppAu);
   }
 
-  pBase = (uint8_t*)WelsMalloc (kuiCountSize, "Access Unit");
+  pBase = (uint8_t*)WelsMallocz (kuiCountSize, "Access Unit");
   if (pBase == NULL)
     return 1;
   pPtr = pBase;
@@ -76,7 +75,8 @@ int32_t MemInitNalList (PAccessUnit* ppAu, const uint32_t kuiSize) {
   (*ppAu)->uiCountUnitsNum	= kuiSize;
   (*ppAu)->uiAvailUnitsNum	= 0;
   (*ppAu)->uiActualUnitsNum	= 0;
-  (*ppAu)->uiEndPos		    = 0;
+  (*ppAu)->uiStartPos           = 0;
+  (*ppAu)->uiEndPos		= 0;
   (*ppAu)->bCompletedAuFlag	= false;
 
   return 0;

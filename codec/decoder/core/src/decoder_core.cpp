@@ -31,36 +31,20 @@
  *	decoder_core.c:	Wels decoder framework core implementation
  */
 
-#include <string.h>
-#include "codec_def.h"
 #include "decoder_core.h"
-#include "typedefs.h"
-#include "wels_const.h"
-#include "wels_common_basis.h"
-#include "codec_app_def.h"
-#include "decoder_context.h"
-#include "dec_golomb.h"
-#include "bit_stream.h"
 #include "error_code.h"
-#include "parameter_sets.h"
-#include "fmo.h"
-#include "utils.h"
 #include "memmgr_nal_unit.h"
-#include "dec_frame.h"
 #include "au_parser.h"
-#include "pic_queue.h"
-#include "ls_defines.h"
 #include "decode_slice.h"
 #include "manage_dec_ref.h"
 #include "expand_pic.h"
 #include "decoder.h"
 #include "decode_mb_aux.h"
-#include "mem_align.h"
+#include "memory_align.h"
+#include "error_concealment.h"
 
 namespace WelsDec {
-
-static inline int32_t DecodeFrameConstruction (PWelsDecoderContext pCtx, uint8_t** ppDst, int32_t* pDstLen,
-    int32_t* pWidth, int32_t* pHeight, SBufferInfo* pDstInfo) {
+static inline int32_t DecodeFrameConstruction (PWelsDecoderContext pCtx, uint8_t** ppDst, SBufferInfo* pDstInfo) {
   PDqLayer pCurDq = pCtx->pCurDqLayer;
   PPicture pPic = pCtx->pDec;
 
@@ -68,42 +52,119 @@ static inline int32_t DecodeFrameConstruction (PWelsDecoderContext pCtx, uint8_t
   const int32_t kiHeight = pCurDq->iMbHeight << 4;
 
   const int32_t kiTotalNumMbInCurLayer = pCurDq->iMbWidth * pCurDq->iMbHeight;
+  bool bFrameCompleteFlag = true;
 
-  if (pPic->iTotalNumMbRec != kiTotalNumMbInCurLayer) {
-    WelsLog (pCtx, WELS_LOG_WARNING,
-             "DecodeFrameConstruction():::iTotalNumMbRec:%d, total_num_mb_sps:%d, cur_layer_mb_width:%d, cur_layer_mb_height:%d \n",
-             pPic->iTotalNumMbRec, kiTotalNumMbInCurLayer, pCurDq->iMbWidth, pCurDq->iMbHeight);
-    return -1;
-  }
-#ifdef NO_WAITING_AU
-  pPic->iTotalNumMbRec = 0;
-#endif
-
-  if (I_SLICE == pCurDq->sLayerInfo.sSliceInLayer.eSliceType) {
+  if (pPic->bNewSeqBegin) {
     memcpy (& (pCtx->sFrameCrop), & (pCurDq->sLayerInfo.sSliceInLayer.sSliceHeaderExt.sSliceHeader.pSps->sFrameCrop),
             sizeof (SPosOffset)); //confirmed_safe_unsafe_usage
 #ifdef LONG_TERM_REF
     pCtx->bParamSetsLostFlag      = false;
 #else
-    pCtx->bReferenceLostAtT0Flag = false;	// need initialize it due I_SLICE, 6/4/2010
+    pCtx->bReferenceLostAtT0Flag = false;	// need initialize it due new seq, 6/4/2010
 #endif //LONG_TERM_REF
-    WelsLog (pCtx, WELS_LOG_INFO,
-             "DecodeFrameConstruction()::::output good I frame, %d x %d, crop_left:%d, crop_right:%d, crop_top:%d, crop_bottom:%d.\n",
-             kiWidth, kiHeight, pCtx->sFrameCrop.iLeftOffset, pCtx->sFrameCrop.iRightOffset, pCtx->sFrameCrop.iTopOffset,
-             pCtx->sFrameCrop.iBottomOffset);
-    WelsLog (pCtx, WELS_LOG_INFO, "After decoding, set_mode:[%s], eWorkMode:[%s], eBufferProperty:[%s]\n",
-             DECODER_MODE_NAME (pCtx->iSetMode), DECODER_MODE_NAME (pCtx->iDecoderMode),
-             OUTPUT_PROPERTY_NAME (pDstInfo->eBufferProperty));
+    if (pCtx->iTotalNumMbRec == kiTotalNumMbInCurLayer) {
+      pCtx->bPrintFrameErrorTraceFlag = true;
+      WelsLog (& (pCtx->sLogCtx), WELS_LOG_INFO,
+               "DecodeFrameConstruction(): will output first frame of new sequence, %d x %d, crop_left:%d, crop_right:%d, crop_top:%d, crop_bottom:%d, ignored error packet:%d.",
+               kiWidth, kiHeight, pCtx->sFrameCrop.iLeftOffset, pCtx->sFrameCrop.iRightOffset, pCtx->sFrameCrop.iTopOffset,
+               pCtx->sFrameCrop.iBottomOffset, pCtx->iIgnoredErrorInfoPacketCount);
+      pCtx->iIgnoredErrorInfoPacketCount = 0;
+    }
   }
 
+  if (pCtx->bParseOnly) { //should exit for parse only to prevent access NULL pDstInfo
+    PAccessUnit pCurAu = pCtx->pAccessUnitList;
+    static bool bFirstIDR = true;
+    if (dsErrorFree == pCtx->iErrorCode) { //correct decoding, add to data buffer
+      SParserBsInfo* pParser = pCtx->pParserBsInfo;
+      SNalUnit* pCurNal = NULL;
+      int32_t iTotalNalLen = 0;
+      int32_t iNalLen = 0;
+      int32_t iNum = 0;
+      while (iNum < pParser->iNalNum) {
+        iTotalNalLen += pParser->iNalLenInByte[iNum++];
+      }
+      uint8_t* pDstBuf = pParser->pDstBuff + iTotalNalLen;
+      int32_t iIdx = pCurAu->uiStartPos;
+      int32_t iEndIdx = pCurAu->uiEndPos;
+      uint8_t* pNalBs = NULL;
+      pParser->uiOutBsTimeStamp = (pCurAu->pNalUnitsList [iIdx]) ? pCurAu->pNalUnitsList [iIdx]->uiTimeStamp : 0;
+      //pParser->iNalNum = 0;
+      pParser->iSpsWidthInPixel = (pCtx->pSps->iMbWidth << 4);
+      pParser->iSpsHeightInPixel = (pCtx->pSps->iMbHeight << 4);
+
+      if (pCurAu->pNalUnitsList [iIdx]->sNalHeaderExt.bIdrFlag) { //IDR
+        if (bFirstIDR) { //add required sps/pps
+          bool bSubSps = (NAL_UNIT_CODED_SLICE_EXT == pCurAu->pNalUnitsList [iIdx]->sNalHeaderExt.sNalUnitHeader.eNalUnitType);
+          SSpsBsInfo* pSpsBs = NULL;
+          SPpsBsInfo* pPpsBs = NULL;
+          int32_t iSpsId = pCtx->pSps->iSpsId;
+          int32_t iPpsId = pCtx->pPps->iPpsId;
+          pCtx->bParamSetsLostFlag = false;
+          //find required sps, pps and write into dst buff
+          pSpsBs = bSubSps ? &pCtx->sSubsetSpsBsInfo [iSpsId] : &pCtx->sSpsBsInfo [iSpsId];
+          memcpy (pDstBuf, pSpsBs->pSpsBsBuf, pSpsBs->uiSpsBsLen);
+          pParser->iNalLenInByte [pParser->iNalNum ++] = pSpsBs->uiSpsBsLen;
+          pCtx->iNalLenInByte[pCtx->iNalNum ++] = pSpsBs->uiSpsBsLen;
+          pDstBuf += pSpsBs->uiSpsBsLen;
+          pPpsBs = &pCtx->sPpsBsInfo [iPpsId];
+          memcpy (pDstBuf, pPpsBs->pPpsBsBuf, pPpsBs->uiPpsBsLen);
+          pParser->iNalLenInByte [pParser->iNalNum ++] = pPpsBs->uiPpsBsLen;
+          pDstBuf += pPpsBs->uiPpsBsLen;
+          bFirstIDR = false;
+        }
+      } else { //IDR required SPS, PPS
+        bFirstIDR = true;
+      }
+      //then VCL data re-write
+      while (iIdx <= iEndIdx) {
+        pCurNal = pCurAu->pNalUnitsList [iIdx ++];
+        iNalLen = pCurNal->sNalData.sVclNal.iNalLength;
+        pNalBs = pCurNal->sNalData.sVclNal.pNalPos;
+        pParser->iNalLenInByte [pParser->iNalNum ++] = iNalLen;
+        memcpy (pDstBuf, pNalBs, iNalLen);
+        pDstBuf += iNalLen;
+      }
+      if (pCtx->iTotalNumMbRec == kiTotalNumMbInCurLayer) { //frame complete
+        pCtx->iTotalNumMbRec = 0;
+        pCtx->bFramePending = false;
+      } else if (pCtx->iTotalNumMbRec != 0) { //frame incomplete
+        pCtx->bFramePending = true;
+        pCtx->pDec->bIsComplete = false;
+        pCtx->iErrorCode |= dsFramePending;
+        return -1;
+        //pCtx->pParserBsInfo->iNalNum = 0;
+      }
+    } else { //error
+      pCtx->pParserBsInfo->uiOutBsTimeStamp = 0;
+      pCtx->pParserBsInfo->iNalNum = 0;
+      pCtx->pParserBsInfo->iSpsWidthInPixel = 0;
+      pCtx->pParserBsInfo->iSpsHeightInPixel = 0;
+      return -1;
+    }
+    return 0;
+  }
+
+  if (pCtx->iTotalNumMbRec != kiTotalNumMbInCurLayer) {
+    WelsLog (& (pCtx->sLogCtx), WELS_LOG_DEBUG,
+             "DecodeFrameConstruction(): iTotalNumMbRec:%d, total_num_mb_sps:%d, cur_layer_mb_width:%d, cur_layer_mb_height:%d ",
+             pCtx->iTotalNumMbRec, kiTotalNumMbInCurLayer, pCurDq->iMbWidth, pCurDq->iMbHeight);
+    bFrameCompleteFlag = false; //return later after output buffer is done
+    if (pCtx->bInstantDecFlag) //no-delay decoding, wait for new slice
+      return -1;
+  } else if (pCurDq->sLayerInfo.sNalHeaderExt.bIdrFlag
+             && (pCtx->iErrorCode == dsErrorFree)) { //complete non-ECed IDR frame done
+    pCtx->pDec->bIsComplete = true;
+    pCtx->bFreezeOutput = false;
+  }
+
+  pCtx->iTotalNumMbRec = 0;
+
   //////output:::normal path
+  pDstInfo->uiOutYuvTimeStamp = pPic->uiTimeStamp;
   ppDst[0]      = pPic->pData[0];
   ppDst[1]      = pPic->pData[1];
   ppDst[2]      = pPic->pData[2];
-  *pDstLen     = pPic->iLinesize[0];
-  * (pDstLen + 1) = pPic->iLinesize[1];
-  *pWidth      = kiWidth;
-  *pHeight     = kiHeight;
 
   pDstInfo->UsrData.sSystemBuffer.iFormat = videoFormatI420;
 
@@ -114,16 +175,41 @@ static inline int32_t DecodeFrameConstruction (PWelsDecoderContext pCtx, uint8_t
   ppDst[0] = ppDst[0] + pCtx->sFrameCrop.iTopOffset * 2 * pPic->iLinesize[0] + pCtx->sFrameCrop.iLeftOffset * 2;
   ppDst[1] = ppDst[1] + pCtx->sFrameCrop.iTopOffset  * pPic->iLinesize[1] + pCtx->sFrameCrop.iLeftOffset;
   ppDst[2] = ppDst[2] + pCtx->sFrameCrop.iTopOffset  * pPic->iLinesize[1] + pCtx->sFrameCrop.iLeftOffset;
-  pDstInfo->eBufferProperty = BUFFER_HOST;
   pDstInfo->iBufferStatus = 1;
+
+  bool bOutResChange = (pCtx->iLastImgWidthInPixel != pDstInfo->UsrData.sSystemBuffer.iWidth)
+                       || (pCtx->iLastImgHeightInPixel != pDstInfo->UsrData.sSystemBuffer.iHeight);
+  pCtx->iLastImgWidthInPixel = pDstInfo->UsrData.sSystemBuffer.iWidth;
+  pCtx->iLastImgHeightInPixel = pDstInfo->UsrData.sSystemBuffer.iHeight;
+  if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) //no buffer output if EC is disabled and frame incomplete
+    pDstInfo->iBufferStatus = (int32_t) (bFrameCompleteFlag
+                                         && pPic->bIsComplete); // When EC disable, ECed picture not output
+  else if ((pCtx->eErrorConMethod == ERROR_CON_SLICE_COPY_CROSS_IDR_FREEZE_RES_CHANGE
+            || pCtx->eErrorConMethod == ERROR_CON_SLICE_MV_COPY_CROSS_IDR_FREEZE_RES_CHANGE)
+           && pCtx->iErrorCode && bOutResChange)
+    pCtx->bFreezeOutput = true;
+
+  if (pDstInfo->iBufferStatus == 0) {
+    if (!bFrameCompleteFlag)
+      pCtx->iErrorCode |= dsBitstreamError;
+    return -1;
+  }
+  if (pCtx->bFreezeOutput) {
+    pDstInfo->iBufferStatus = 0;
+    if (pPic->bNewSeqBegin) {
+      WelsLog (& (pCtx->sLogCtx), WELS_LOG_INFO, "DecodeFrameConstruction():New sequence detected, but freezed.");
+    }
+  }
+  pCtx->iMbEcedNum = pPic->iMbEcedNum;
+  pCtx->iMbNum = pPic->iMbNum;
+  pCtx->iMbEcedPropNum = pPic->iMbEcedPropNum;
+  UpdateDecStat (pCtx, pDstInfo->iBufferStatus != 0);
 
   return 0;
 }
 
-inline BOOL_T    CheckSliceNeedReconstruct (int16_t iCurDid, int16_t iCurQid, bool_t bStoreRefBasePicFlag,
-    uint8_t uiDidMax, uint8_t uiLayerDqId, uint8_t uiTargetDqId) {
-  return ((iCurDid == uiDidMax) && (iCurQid == BASE_QUALITY_ID) && (bStoreRefBasePicFlag))   // store base
-         || (uiLayerDqId == uiTargetDqId); // target layer
+inline bool    CheckSliceNeedReconstruct (uint8_t uiLayerDqId, uint8_t uiTargetDqId) {
+  return (uiLayerDqId == uiTargetDqId); // target layer
 }
 
 inline uint8_t GetTargetDqId (uint8_t uiTargetDqId,  SDecodingParam* psParam) {
@@ -133,27 +219,17 @@ inline uint8_t GetTargetDqId (uint8_t uiTargetDqId,  SDecodingParam* psParam) {
 }
 
 
-inline void_t    HandleReferenceLostL0 (PWelsDecoderContext pCtx, PNalUnit pCurNal) {
+inline void    HandleReferenceLostL0 (PWelsDecoderContext pCtx, PNalUnit pCurNal) {
   if (0 == pCurNal->sNalHeaderExt.uiTemporalId) {
     pCtx->bReferenceLostAtT0Flag = true;
   }
-#ifndef LONG_TERM_REF
-  if (pCtx->bReferenceLostAtT0Flag) {
-    ResetParameterSetsState (pCtx);
-  }
-#endif
   pCtx->iErrorCode |= dsBitstreamError;
 }
 
-inline void_t    HandleReferenceLost (PWelsDecoderContext pCtx, PNalUnit pCurNal) {
+inline void    HandleReferenceLost (PWelsDecoderContext pCtx, PNalUnit pCurNal) {
   if ((0 == pCurNal->sNalHeaderExt.uiTemporalId) || (1 == pCurNal->sNalHeaderExt.uiTemporalId)) {
     pCtx->bReferenceLostAtT0Flag = true;
   }
-#ifndef LONG_TERM_REF
-  if (pCtx->bReferenceLostAtT0Flag) {
-    ResetParameterSetsState (pCtx);
-  }
-#endif
   pCtx->iErrorCode |= dsRefLost;
 }
 
@@ -167,25 +243,100 @@ inline int32_t  WelsDecodeConstructSlice (PWelsDecoderContext pCtx, PNalUnit pCu
   return iRet;
 }
 
+int32_t ParsePredWeightedTable (PBitStringAux pBs, PSliceHeader pSh) {
+  uint32_t uiCode;
+  int32_t iList = 0;
+  int32_t iCode;
+
+  WELS_READ_VERIFY (BsGetUe (pBs, &uiCode));
+  WELS_CHECK_SE_BOTH_ERROR_NOLOG (uiCode, 0, 7, "luma_log2_weight_denom",
+                                  GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_LUMA_LOG2_WEIGHT_DENOM));
+  pSh->sPredWeightTable.uiLumaLog2WeightDenom = uiCode;
+  if (pSh->pSps->uiChromaArrayType != 0) {
+    WELS_READ_VERIFY (BsGetUe (pBs, &uiCode));
+    WELS_CHECK_SE_BOTH_ERROR_NOLOG (uiCode, 0, 7, "chroma_log2_weight_denom",
+                                    GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_CHROMA_LOG2_WEIGHT_DENOM));
+    pSh->sPredWeightTable.uiChromaLog2WeightDenom = uiCode;
+  }
+
+
+  do {
+
+    for (int i = 0; i < pSh->uiRefCount[iList]; i++) {
+      //luma
+      WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode));
+      if (!!uiCode) {
+
+        WELS_READ_VERIFY (BsGetSe (pBs, &iCode));
+        WELS_CHECK_SE_BOTH_ERROR_NOLOG (iCode, -128, 127, "luma_weight",
+                                        GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_LUMA_WEIGHT));
+        pSh->sPredWeightTable.sPredList[iList].iLumaWeight[i] = iCode;
+
+        WELS_READ_VERIFY (BsGetSe (pBs, &iCode));
+        WELS_CHECK_SE_BOTH_ERROR_NOLOG (iCode, -128, 127, "luma_offset",
+                                        GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_LUMA_OFFSET));
+        pSh->sPredWeightTable.sPredList[iList].iLumaOffset[i] = iCode;
+      } else {
+        pSh->sPredWeightTable.sPredList[iList].iLumaWeight[i] = 1 << (pSh->sPredWeightTable.uiLumaLog2WeightDenom);
+        pSh->sPredWeightTable.sPredList[iList].iLumaOffset[i] = 0;
+
+      }
+      //chroma
+      if (pSh->pSps->uiChromaArrayType == 0)
+        continue;
+
+      WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode));
+      if (!!uiCode) {
+        for (int j = 0; j < 2; j++) {
+
+
+          WELS_READ_VERIFY (BsGetSe (pBs, &iCode));
+          WELS_CHECK_SE_BOTH_ERROR_NOLOG (iCode, -128, 127, "chroma_weight",
+                                          GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_CHROMA_WEIGHT));
+          pSh->sPredWeightTable.sPredList[iList].iChromaWeight[i][j] = iCode;
+
+          WELS_READ_VERIFY (BsGetSe (pBs, &iCode));
+          WELS_CHECK_SE_BOTH_ERROR_NOLOG (iCode, -128, 127, "chroma_offset",
+                                          GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_CHROMA_OFFSET));
+          pSh->sPredWeightTable.sPredList[iList].iChromaOffset[i][j] = iCode;
+        }
+      } else {
+        for (int j = 0; j < 2; j++) {
+
+
+          pSh->sPredWeightTable.sPredList[iList].iChromaWeight[i][j] = 1 << (pSh->sPredWeightTable.uiChromaLog2WeightDenom);
+          pSh->sPredWeightTable.sPredList[iList].iChromaOffset[i][j] = 0;
+        }
+      }
+
+    }
+    ++iList;
+  } while (iList < LIST_1);//TODO: SUPPORT LIST_A
+  return ERR_NONE;
+}
+
 /*
  *	Predeclared function routines ..
  */
 int32_t ParseRefPicListReordering (PBitStringAux pBs, PSliceHeader pSh) {
   int32_t iList = 0;
-  const ESliceType keSt = pSh->eSliceType;
+  const EWelsSliceType keSt = pSh->eSliceType;
   PRefPicListReorderSyn pRefPicListReordering = &pSh->pRefPicListReordering;
-
+  PSps pSps = pSh->pSps;
+  uint32_t uiCode;
   if (keSt == I_SLICE || keSt == SI_SLICE)
     return ERR_NONE;
 
   // Common syntaxs for P or B slices: list0, list1 followed if B slices used.
   do {
-    pRefPicListReordering->bRefPicListReorderingFlag[iList]	= !!BsGetOneBit (pBs);
+    WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //ref_pic_list_modification_flag_l0
+    pRefPicListReordering->bRefPicListReorderingFlag[iList]	= !!uiCode;
 
     if (pRefPicListReordering->bRefPicListReorderingFlag[iList]) {
       int32_t iIdx = 0;
       do {
-        const uint8_t kuiIdc = BsGetUe (pBs);
+        WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //modification_of_pic_nums_idc
+        const uint32_t kuiIdc = uiCode;
 
         //Fixed the referrence list reordering crash issue.(fault kIdc value > 3 case)---
         if ((iIdx >= MAX_REF_PIC_COUNT) || (kuiIdc > 3)) {
@@ -199,9 +350,15 @@ int32_t ParseRefPicListReordering (PBitStringAux pBs, PSliceHeader pSh) {
           return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_REF_REORDERING);
 
         if (kuiIdc == 0 || kuiIdc == 1) {
-          pRefPicListReordering->sReorderingSyn[iList][iIdx].uiAbsDiffPicNumMinus1 = BsGetUe (pBs);	// uiAbsDiffPicNumMinus1
+          // abs_diff_pic_num_minus1 should be in range 0 to MaxPicNum-1, MaxPicNum is derived as
+          // 2^(4+log2_max_frame_num_minus4)
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //abs_diff_pic_num_minus1
+          WELS_CHECK_SE_UPPER_ERROR_NOLOG (uiCode, (uint32_t) (1 << pSps->uiLog2MaxFrameNum), "abs_diff_pic_num_minus1",
+                                           GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_REF_REORDERING));
+          pRefPicListReordering->sReorderingSyn[iList][iIdx].uiAbsDiffPicNumMinus1 = uiCode;	// uiAbsDiffPicNumMinus1
         } else if (kuiIdc == 2) {
-          pRefPicListReordering->sReorderingSyn[iList][iIdx].uiLongTermPicNum = BsGetUe (pBs);
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //long_term_pic_num
+          pRefPicListReordering->sReorderingSyn[iList][iIdx].uiLongTermPicNum = uiCode;
         }
 
         ++ iIdx;
@@ -216,34 +373,43 @@ int32_t ParseRefPicListReordering (PBitStringAux pBs, PSliceHeader pSh) {
 }
 
 int32_t ParseDecRefPicMarking (PWelsDecoderContext pCtx, PBitStringAux pBs, PSliceHeader pSh, PSps pSps,
-                               const bool_t kbIdrFlag) {
+                               const bool kbIdrFlag) {
   PRefPicMarking const kpRefMarking = &pSh->sRefMarking;
-
+  uint32_t uiCode;
   if (kbIdrFlag) {
-    kpRefMarking->bNoOutputOfPriorPicsFlag	= !!BsGetOneBit (pBs);
-    kpRefMarking->bLongTermRefFlag			= !!BsGetOneBit (pBs);
+    WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //no_output_of_prior_pics_flag
+    kpRefMarking->bNoOutputOfPriorPicsFlag	= !!uiCode;
+    WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //long_term_reference_flag
+    kpRefMarking->bLongTermRefFlag			= !!uiCode;
   } else {
-    kpRefMarking->bAdaptiveRefPicMarkingModeFlag	= !!BsGetOneBit (pBs);
+    WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //adaptive_ref_pic_marking_mode_flag
+    kpRefMarking->bAdaptiveRefPicMarkingModeFlag	= !!uiCode;
     if (kpRefMarking->bAdaptiveRefPicMarkingModeFlag) {
       int32_t iIdx = 0;
       do {
-        const int32_t kiMmco = BsGetUe (pBs);
+        WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //memory_management_control_operation
+        const int32_t kiMmco = uiCode;
 
         kpRefMarking->sMmcoRef[iIdx].uiMmcoType = kiMmco;
         if (kiMmco == MMCO_END)
           break;
 
         if (kiMmco == MMCO_SHORT2UNUSED || kiMmco == MMCO_SHORT2LONG) {
-          kpRefMarking->sMmcoRef[iIdx].iDiffOfPicNum = 1 + BsGetUe (pBs);
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //difference_of_pic_nums_minus1
+          kpRefMarking->sMmcoRef[iIdx].iDiffOfPicNum = 1 + uiCode;
           kpRefMarking->sMmcoRef[iIdx].iShortFrameNum = (pSh->iFrameNum - kpRefMarking->sMmcoRef[iIdx].iDiffOfPicNum) & ((
                 1 << pSps->uiLog2MaxFrameNum) - 1);
-        } else if (kiMmco == MMCO_LONG2UNUSED)
-          kpRefMarking->sMmcoRef[iIdx].uiLongTermPicNum = BsGetUe (pBs);
-
+        } else if (kiMmco == MMCO_LONG2UNUSED) {
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //long_term_pic_num
+          kpRefMarking->sMmcoRef[iIdx].uiLongTermPicNum = uiCode;
+        }
         if (kiMmco == MMCO_SHORT2LONG || kiMmco == MMCO_LONG) {
-          kpRefMarking->sMmcoRef[iIdx].iLongTermFrameIdx = BsGetUe (pBs);
-        } else if (kiMmco == MMCO_SET_MAX_LONG)
-          kpRefMarking->sMmcoRef[iIdx].iMaxLongTermFrameIdx = -1 + BsGetUe (pBs);
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //long_term_frame_idx
+          kpRefMarking->sMmcoRef[iIdx].iLongTermFrameIdx = uiCode;
+        } else if (kiMmco == MMCO_SET_MAX_LONG) {
+          WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //max_long_term_frame_idx_plus1
+          kpRefMarking->sMmcoRef[iIdx].iMaxLongTermFrameIdx = -1 + uiCode;
+        }
         ++ iIdx;
 
       } while (iIdx < MAX_MMCO_COUNT);
@@ -253,7 +419,7 @@ int32_t ParseDecRefPicMarking (PWelsDecoderContext pCtx, PBitStringAux pBs, PSli
   return ERR_NONE;
 }
 
-bool_t FillDefaultSliceHeaderExt (PSliceHeaderExt pShExt, PNalUnitHeaderExt pNalExt) {
+bool FillDefaultSliceHeaderExt (PSliceHeaderExt pShExt, PNalUnitHeaderExt pNalExt) {
   if (pShExt == NULL || pNalExt == NULL)
     return false;
 
@@ -287,6 +453,86 @@ bool_t FillDefaultSliceHeaderExt (PSliceHeaderExt pShExt, PNalUnitHeaderExt pNal
   return true;
 }
 
+int32_t InitBsBuffer (PWelsDecoderContext pCtx) {
+  if (pCtx == NULL)
+    return ERR_INFO_INVALID_PTR;
+
+  pCtx->iMaxBsBufferSizeInByte = MIN_ACCESS_UNIT_CAPACITY * MAX_BUFFERED_NUM;
+  if ((pCtx->sRawData.pHead = static_cast<uint8_t*> (WelsMallocz (pCtx->iMaxBsBufferSizeInByte,
+                              "pCtx->sRawData.pHead"))) == NULL) {
+    return ERR_INFO_OUT_OF_MEMORY;
+  }
+  pCtx->sRawData.pStartPos = pCtx->sRawData.pCurPos = pCtx->sRawData.pHead;
+  pCtx->sRawData.pEnd = pCtx->sRawData.pHead + pCtx->iMaxBsBufferSizeInByte;
+  if (pCtx->bParseOnly) {
+    pCtx->pParserBsInfo = static_cast<SParserBsInfo*> (WelsMallocz (sizeof (SParserBsInfo), "pCtx->pParserBsInfo"));
+    if (pCtx->pParserBsInfo == NULL) {
+      return ERR_INFO_OUT_OF_MEMORY;
+    }
+    memset (pCtx->pParserBsInfo, 0, sizeof (SParserBsInfo));
+    pCtx->pParserBsInfo->pDstBuff = static_cast<uint8_t*> (WelsMallocz (MAX_ACCESS_UNIT_CAPACITY * sizeof (uint8_t),
+                                    "pCtx->pParserBsInfo->pDstBuff"));
+    if (pCtx->pParserBsInfo->pDstBuff == NULL) {
+      return ERR_INFO_OUT_OF_MEMORY;
+    }
+    memset (pCtx->pParserBsInfo->pDstBuff, 0, MAX_ACCESS_UNIT_CAPACITY * sizeof (uint8_t));
+
+    if ((pCtx->sSavedData.pHead = static_cast<uint8_t*> (WelsMallocz (pCtx->iMaxBsBufferSizeInByte,
+                                  "pCtx->sSavedData.pHead"))) == NULL) {
+      return ERR_INFO_OUT_OF_MEMORY;
+    }
+    pCtx->sSavedData.pStartPos = pCtx->sSavedData.pCurPos = pCtx->sSavedData.pHead;
+    pCtx->sSavedData.pEnd = pCtx->sSavedData.pHead + pCtx->iMaxBsBufferSizeInByte;
+  }
+  return ERR_NONE;
+}
+
+int32_t ExpandBsBuffer (PWelsDecoderContext pCtx, const int kiSrcLen) {
+  if (pCtx == NULL)
+    return ERR_INFO_INVALID_PTR;
+  int32_t iExpandStepShift = 1;
+  int32_t iNewBuffLen = WELS_MAX ((kiSrcLen * MAX_BUFFERED_NUM), (pCtx->iMaxBsBufferSizeInByte << iExpandStepShift));
+  //allocate new bs buffer
+  uint8_t* pNewBsBuff = static_cast<uint8_t*> (WelsMallocz (iNewBuffLen, "pCtx->sRawData.pHead"));
+  if (pNewBsBuff == NULL)
+    return ERR_INFO_OUT_OF_MEMORY;
+
+  //Calculate and set the bs start and end position
+  for (uint32_t i = 0; i <= pCtx->pAccessUnitList->uiActualUnitsNum; i++) {
+    PBitStringAux pSliceBitsRead = &pCtx->pAccessUnitList->pNalUnitsList[i]->sNalData.sVclNal.sSliceBitsRead;
+    pSliceBitsRead->pStartBuf = pSliceBitsRead->pStartBuf - pCtx->sRawData.pHead + pNewBsBuff;
+    pSliceBitsRead->pEndBuf   = pSliceBitsRead->pEndBuf   - pCtx->sRawData.pHead + pNewBsBuff;
+    pSliceBitsRead->pCurBuf   = pSliceBitsRead->pCurBuf   - pCtx->sRawData.pHead + pNewBsBuff;
+  }
+
+  //Copy current buffer status to new buffer
+  memcpy (pNewBsBuff, pCtx->sRawData.pHead, pCtx->iMaxBsBufferSizeInByte);
+  pCtx->iMaxBsBufferSizeInByte = iNewBuffLen;
+  pCtx->sRawData.pStartPos = pNewBsBuff + (pCtx->sRawData.pStartPos - pCtx->sRawData.pHead);
+  pCtx->sRawData.pCurPos = pNewBsBuff + (pCtx->sRawData.pCurPos - pCtx->sRawData.pHead);
+  pCtx->sRawData.pEnd = pNewBsBuff + iNewBuffLen;
+  WelsFree (pCtx->sRawData.pHead, "pCtx->sRawData.pHead");
+  pCtx->sRawData.pHead = pNewBsBuff;
+  return ERR_NONE;
+}
+
+int32_t CheckBsBuffer (PWelsDecoderContext pCtx, const int32_t kiSrcLen) {
+  if (kiSrcLen > MAX_ACCESS_UNIT_CAPACITY) { //exceeds max allowed data
+    WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING, "Max AU size exceeded. Allowed size = %d, current size = %d",
+             MAX_ACCESS_UNIT_CAPACITY,
+             kiSrcLen);
+    pCtx->iErrorCode |= dsBitstreamError;
+    return ERR_INFO_INVALID_ACCESS;
+  } else if (kiSrcLen > pCtx->iMaxBsBufferSizeInByte /
+             MAX_BUFFERED_NUM) { //may lead to buffer overwrite, prevent it by expanding buffer
+    if (ExpandBsBuffer (pCtx, kiSrcLen)) {
+      return ERR_INFO_OUT_OF_MEMORY;
+    }
+  }
+
+  return ERR_NONE;
+}
+
 /*
  * WelsInitMemory
  * Memory request for new introduced data
@@ -303,18 +549,11 @@ int32_t WelsInitMemory (PWelsDecoderContext pCtx) {
   if (MemInitNalList (&pCtx->pAccessUnitList, MAX_NAL_UNIT_NUM_IN_AU) != 0)
     return ERR_INFO_OUT_OF_MEMORY;
 
-  if ((pCtx->sRawData.pHead = static_cast<uint8_t*> (WelsMalloc (MAX_ACCESS_UINT_CAPACITY,
-                              "pCtx->sRawData->pHead"))) == NULL) {
+  if (InitBsBuffer (pCtx) != 0)
     return ERR_INFO_OUT_OF_MEMORY;
-  }
-  pCtx->sRawData.pStartPos               =
-    pCtx->sRawData.pCurPos                 = pCtx->sRawData.pHead;
-  pCtx->sRawData.pEnd                     = pCtx->sRawData.pHead + MAX_ACCESS_UINT_CAPACITY;
 
   pCtx->uiTargetDqId			= (uint8_t) - 1;
   pCtx->bEndOfStreamFlag	= false;
-  pCtx->iImgWidthInPixel	= 0;
-  pCtx->iImgHeightInPixel	= 0;
 
   return ERR_NONE;
 }
@@ -324,7 +563,7 @@ int32_t WelsInitMemory (PWelsDecoderContext pCtx) {
  * Free memory introduced in WelsInitMemory at destruction of decoder.
  *
  */
-void_t WelsFreeMemory (PWelsDecoderContext pCtx) {
+void WelsFreeMemory (PWelsDecoderContext pCtx) {
   if (pCtx == NULL)
     return;
 
@@ -343,8 +582,24 @@ void_t WelsFreeMemory (PWelsDecoderContext pCtx) {
   pCtx->sRawData.pEnd                 = NULL;
   pCtx->sRawData.pStartPos	        = NULL;
   pCtx->sRawData.pCurPos             = NULL;
+  if (pCtx->bParseOnly) {
+    if (pCtx->sSavedData.pHead) {
+      WelsFree (pCtx->sSavedData.pHead, "pCtx->sSavedData->pHead");
+    }
+    pCtx->sSavedData.pHead                = NULL;
+    pCtx->sSavedData.pEnd                 = NULL;
+    pCtx->sSavedData.pStartPos	        = NULL;
+    pCtx->sSavedData.pCurPos              = NULL;
+    if (pCtx->pParserBsInfo) {
+      if (pCtx->pParserBsInfo->pDstBuff) {
+        WelsFree (pCtx->pParserBsInfo->pDstBuff, "pCtx->pParserBsInfo->pDstBuff");
+        pCtx->pParserBsInfo->pDstBuff = NULL;
+      }
+      WelsFree (pCtx->pParserBsInfo, "pCtx->pParserBsInfo");
+      pCtx->pParserBsInfo = NULL;
+    }
+  }
 }
-
 /*
  *	DecodeNalHeaderExt
  *	Trigger condition: NAL_UNIT_TYPE = NAL_UNIT_PREFIX or NAL_UNIT_CODED_SLICE_EXT
@@ -352,7 +607,7 @@ void_t WelsFreeMemory (PWelsDecoderContext pCtx) {
  *	pNal:	target NALUnit ptr
  *	pSrc:	NAL Unit bitstream
  */
-void_t DecodeNalHeaderExt (PNalUnit pNal, uint8_t* pSrc) {
+void DecodeNalHeaderExt (PNalUnit pNal, uint8_t* pSrc) {
   PNalUnitHeaderExt pHeaderExt = &pNal->sNalHeaderExt;
 
   uint8_t uiCurByte = *pSrc;
@@ -373,104 +628,19 @@ void_t DecodeNalHeaderExt (PNalUnit pNal, uint8_t* pSrc) {
 }
 
 
-#ifdef MOSAIC_AVOID_BASED_ON_SPS_PPS_ID
-int32_t CheckPpsId (PWelsDecoderContext pCtx, PPps* ppPps, uint32_t uiPpsId) {
-  PPps pPpsList = pCtx->sPpsBuffer;
-  int32_t iPpsNum = pCtx->iPpsTotalNum;
-  int32_t i = 0;
-
-  if (iPpsNum <= 0) {
-    pCtx->iErrorCode |= dsNoParamSets;
-
-    WelsLog (pCtx, WELS_LOG_WARNING, "CheckPpsId():::::PPS list is empty...NO PPS!!!\n");
-    return dsNoParamSets;
-  }
-
-  while (i < iPpsNum) {
-    if (uiPpsId == pPpsList[i].iPpsId) {
-      *ppPps = &pPpsList[i];
-      break;
-    } else {
-      ++i;
-    }
-  }
-
-  if (i == iPpsNum) {
-    pCtx->iErrorCode |= dsNoParamSets;
-
-    WelsLog (pCtx, WELS_LOG_WARNING, "CheckPpsId()::::::CAN NOT find the matching from the PPS List.  iPpsId:%d\n",
-             uiPpsId);
-    return dsNoParamSets;
-  }
-
-  return 0;
-}
-
-int32_t CheckSpsId (PWelsDecoderContext pCtx, PSubsetSps* ppSubsetSps, PSps* ppSps, int32_t iSpsId,
-                    bool_t bExtensionFlag) {
-  PSps pSpsList = pCtx->sSpsBuffer;
-  PSubsetSps pSubspsList = pCtx->sSubsetSpsBuffer;
-
-  int32_t iSpsNum    = pCtx->iSpsTotalNum;
-  int32_t iSubspsNum = pCtx->iSubspsTotalNum;
-  int32_t i = 0;
-
-  if (bExtensionFlag) {
-    if (iSubspsNum <= 0) {
-      pCtx->iErrorCode |= dsNoParamSets;
-
-      WelsLog (pCtx, WELS_LOG_WARNING, "CheckSpsId()::::SUBSPS list is empty....NO SUBSPS\n");
-      return dsNoParamSets;
-    }
-    while (i < iSubspsNum) {
-      if (iSpsId == pSubspsList[i].sSps.iSpsId) {
-        *ppSubsetSps = &pSubspsList[i];
-        *ppSps       = &pSubspsList[i].sSps;
-        break;
-      } else {
-        ++i;
-      }
-    }
-    if (i == iSubspsNum) {
-      pCtx->iErrorCode |= dsNoParamSets;
-
-      WelsLog (pCtx, WELS_LOG_WARNING, "CheckSpsId()::::::CAN NOT find the matching from the SUBSPS List.  iSpsId:%d\n",
-               iSpsId);
-      return dsNoParamSets;
-    }
-  } else {
-    if (iSpsNum <= 0) {
-      pCtx->iErrorCode |= dsNoParamSets;
-
-      WelsLog (pCtx, WELS_LOG_WARNING, "CheckSpsId()::::SPS list is empty....NO SPS\n");
-      return dsNoParamSets;
-    }
-    while (i < iSpsNum) {
-      if (iSpsId == pSpsList[i].iSpsId) {
-        *ppSubsetSps = NULL;
-        *ppSps       = &pSpsList[i];
-        break;
-      } else {
-        ++i;
-      }
-    }
-    if (i == iSpsNum) {
-      pCtx->iErrorCode |= dsNoParamSets;
-
-      WelsLog (pCtx, WELS_LOG_WARNING, "CheckSpsId()::::::CAN NOT find the matching from the SPS List.  iSpsId:%d\n", iSpsId);
-      return dsNoParamSets;
-    }
-  }
-
-  return 0;
-}
-
-#endif
+#define SLICE_HEADER_IDR_PIC_ID_MAX 65535
+#define SLICE_HEADER_REDUNDANT_PIC_CNT_MAX 127
+#define SLICE_HEADER_ALPHAC0_BETA_OFFSET_MIN -12
+#define SLICE_HEADER_ALPHAC0_BETA_OFFSET_MAX 12
+#define SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MIN -12
+#define SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MAX 12
+#define MAX_NUM_REF_IDX_L0_ACTIVE_MINUS1 15
+#define SLICE_HEADER_CABAC_INIT_IDC_MAX 2
 /*
  *	decode_slice_header_avc
  *	Parse slice header of bitstream in avc for storing data structure
  */
-int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, const bool_t kbExtensionFlag) {
+int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, const bool kbExtensionFlag) {
   PNalUnit const kpCurNal				= pCtx->pAccessUnitList->pNalUnitsList[pCtx->pAccessUnitList->uiAvailUnitsNum - 1];
 
   PNalUnitHeaderExt pNalHeaderExt	= NULL;
@@ -479,13 +649,16 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
   PSubsetSps pSubsetSps				= NULL;
   PSps pSps							= NULL;
   PPps pPps							= NULL;
-  ENalUnitType eNalType				= static_cast<ENalUnitType> (0);
+  EWelsNalUnitType eNalType				= static_cast<EWelsNalUnitType> (0);
   int32_t iPpsId						= 0;
   int32_t iRet						= ERR_NONE;
   uint8_t uiSliceType				= 0;
   uint8_t uiQualityId					= BASE_QUALITY_ID;
-  bool_t	bIdrFlag					= false;
-  bool_t	bSgChangeCycleInvolved	= false;	// involved slice group change cycle ?
+  bool	bIdrFlag					= false;
+  bool	bSgChangeCycleInvolved	= false;	// involved slice group change cycle ?
+  uint32_t uiCode;
+  int32_t iCode;
+  SLogContext* pLogCtx = & (pCtx->sLogCtx);
 
   if (kpCurNal == NULL) {
     return ERR_INFO_OUT_OF_MEMORY;
@@ -499,7 +672,7 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
 
   if (pSliceHeadExt) {
     SRefBasePicMarking sBaseMarking;
-    const bool_t kbStoreRefBaseFlag = pSliceHeadExt->bStoreRefBasePicFlag;
+    const bool kbStoreRefBaseFlag = pSliceHeadExt->bStoreRefBasePicFlag;
     memcpy (&sBaseMarking, &pSliceHeadExt->sRefBasePicMarking, sizeof (SRefBasePicMarking)); //confirmed_safe_unsafe_usage
     memset (pSliceHeadExt, 0, sizeof (SSliceHeaderExt));
     pSliceHeadExt->bStoreRefBasePicFlag	= kbStoreRefBaseFlag;
@@ -508,65 +681,104 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
 
   kpCurNal->sNalData.sVclNal.bSliceHeaderExtFlag	= kbExtensionFlag;
 
-  pSliceHead->iFirstMbInSlice	= BsGetUe (pBs);
+  // first_mb_in_slice
+  WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //first_mb_in_slice
+  pSliceHead->iFirstMbInSlice	= uiCode;
 
-  uiSliceType = BsGetUe (pBs);
+  WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //slice_type
+  uiSliceType = uiCode;
   if (uiSliceType > 9) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "slice type too large (%d) at first_mb(%d)\n", uiSliceType,
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "slice type too large (%d) at first_mb(%d)", uiSliceType,
              pSliceHead->iFirstMbInSlice);
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SLICE_TYPE);
   }
   if (uiSliceType > 4)
     uiSliceType -= 5;
 
+  if (B_SLICE == uiSliceType) {
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): B slice not supported.");
+    return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_BIPRED);
+  }
+  if ((NAL_UNIT_CODED_SLICE_IDR == eNalType) && (I_SLICE != uiSliceType)) {
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "Invalid slice type(%d) in IDR picture. ", uiSliceType);
+    return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SLICE_TYPE);
+  }
+
   if (kbExtensionFlag) {
     if (uiSliceType > 2) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "Invalid slice type(%d).\n", uiSliceType);
+      WelsLog (pLogCtx, WELS_LOG_WARNING, "Invalid slice type(%d).", uiSliceType);
       return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SLICE_TYPE);
     }
   }
 
-  pSliceHead->eSliceType	= static_cast <ESliceType> (uiSliceType);
+  pSliceHead->eSliceType	= static_cast <EWelsSliceType> (uiSliceType);
 
-  iPpsId = BsGetUe (pBs);
+  WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //pic_parameter_set_id
+  iPpsId = uiCode;
 
   if (iPpsId >= MAX_PPS_COUNT) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "iPpsId out of range\n");
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "iPpsId out of range");
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_PPS_ID_OVERFLOW);
   }
 
-#ifdef MOSAIC_AVOID_BASED_ON_SPS_PPS_ID
-  if (CheckPpsId (pCtx, &pPps, iPpsId)) {
-    return dsNoParamSets;
+  //add check PPS available here
+  if (pCtx->bPpsAvailFlags[iPpsId] == false) {
+    pCtx->sDecoderStatistics.iPpsReportErrorNum++;
+    if (pCtx->iPPSLastInvalidId != iPpsId) {
+      WelsLog (pLogCtx, WELS_LOG_ERROR, "PPS id (%d) is invalid, previous id (%d) error ignored (%d)!", iPpsId,
+               pCtx->iPPSLastInvalidId, pCtx->iPPSInvalidNum);
+      pCtx->iPPSLastInvalidId = iPpsId;
+      pCtx->iPPSInvalidNum = 0;
+    } else {
+      pCtx->iPPSInvalidNum++;
+    }
+    pCtx->iErrorCode |= dsNoParamSets;
+    return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_PPS_ID);
   }
-#else
+  pCtx->iPPSLastInvalidId = -1;
+
   pPps    = &pCtx->sPpsBuffer[iPpsId];
-#endif //MOSAIC_AVOID_BASED_ON_SPS_PPS_ID
 
   if (pPps->uiNumSliceGroups == 0) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "non existing PPS referenced\n");
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "Invalid PPS referenced");
+    pCtx->iErrorCode |= dsNoParamSets;
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_NO_PARAM_SETS);
   }
 
-  if (pPps->iSpsId >= MAX_SPS_COUNT) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "iSpsId out of range\n");
-    return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_SPS_ID_OVERFLOW);
-  }
-
-
-#ifdef MOSAIC_AVOID_BASED_ON_SPS_PPS_ID
-  if (CheckSpsId (pCtx, &pSubsetSps, &pSps, pPps->iSpsId, kExtensionFlag)) {
-    return dsNoParamSets;
-  }
-#else
   if (kbExtensionFlag) {
-    pSubsetSps	= &pCtx->sSubsetSpsBuffer[pPps->iSpsId];
+    pSubsetSps      = &pCtx->sSubsetSpsBuffer[pPps->iSpsId];
     pSps		= &pSubsetSps->sSps;
+    if (pCtx->bSubspsAvailFlags[pPps->iSpsId] == false) {
+      pCtx->sDecoderStatistics.iSubSpsReportErrorNum++;
+      if (pCtx->iSubSPSLastInvalidId != pPps->iSpsId) {
+        WelsLog (pLogCtx, WELS_LOG_ERROR, "Sub SPS id (%d) is invalid, previous id (%d) error ignored (%d)!", pPps->iSpsId,
+                 pCtx->iSubSPSLastInvalidId, pCtx->iSubSPSInvalidNum);
+        pCtx->iSubSPSLastInvalidId = pPps->iSpsId;
+        pCtx->iSubSPSInvalidNum = 0;
+      } else {
+        pCtx->iSubSPSInvalidNum++;
+      }
+      pCtx->iErrorCode |= dsNoParamSets;
+      return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SPS_ID);
+    }
+    pCtx->iSubSPSLastInvalidId = -1;
   } else {
+    if (pCtx->bSpsAvailFlags[pPps->iSpsId] == false) {
+      pCtx->sDecoderStatistics.iSpsReportErrorNum++;
+      if (pCtx->iSPSLastInvalidId != pPps->iSpsId) {
+        WelsLog (pLogCtx, WELS_LOG_ERROR, "SPS id (%d) is invalid, previous id (%d) error ignored (%d)!", pPps->iSpsId,
+                 pCtx->iSPSLastInvalidId, pCtx->iSPSInvalidNum);
+        pCtx->iSPSLastInvalidId = pPps->iSpsId;
+        pCtx->iSPSInvalidNum = 0;
+      } else {
+        pCtx->iSPSInvalidNum++;
+      }
+      pCtx->iErrorCode |= dsNoParamSets;
+      return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SPS_ID);
+    }
+    pCtx->iSPSLastInvalidId = -1;
     pSps		= &pCtx->sSpsBuffer[pPps->iSpsId];
   }
-  pCtx->pSps			= pSps;
-#endif //MOSAIC_AVOID_BASED_ON_SPS_PPS_ID
   pSliceHead->iPpsId = iPpsId;
   pSliceHead->iSpsId = pPps->iSpsId;
   pSliceHead->pPps   = pPps;
@@ -575,17 +787,22 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
   pSliceHeadExt->pSubsetSps = pSubsetSps;
 
   bIdrFlag = (!kbExtensionFlag && eNalType == NAL_UNIT_CODED_SLICE_IDR) || (kbExtensionFlag && pNalHeaderExt->bIdrFlag);
+  pSliceHead->bIdrFlag = bIdrFlag;
 
   if (pSps->uiLog2MaxFrameNum == 0) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "non existing SPS referenced\n");
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "non existing SPS referenced");
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_NO_PARAM_SETS);
   }
-  pSliceHead->iFrameNum = BsGetBits (pBs, pSps->uiLog2MaxFrameNum);
+  // check first_mb_in_slice
+  WELS_CHECK_SE_UPPER_ERROR ((uint32_t) (pSliceHead->iFirstMbInSlice), pSps->uiTotalMbCount, "first_mb_in_slice",
+                             GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_FIRST_MB_IN_SLICE));
+  WELS_READ_VERIFY (BsGetBits (pBs, pSps->uiLog2MaxFrameNum, &uiCode)); //frame_num
+  pSliceHead->iFrameNum = uiCode;
 
   pSliceHead->bFieldPicFlag		= false;
   pSliceHead->bBottomFiledFlag	= false;
   if (!pSps->bFrameMbsOnlyFlag) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): frame_mbs_only_flag = %d not supported. \n",
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): frame_mbs_only_flag = %d not supported. ",
              pSps->bFrameMbsOnlyFlag);
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_MBAFF);
   }
@@ -594,11 +811,16 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
 
   if (bIdrFlag) {
     if (pSliceHead->iFrameNum != 0) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(), invaild frame number: %d due to IDR frame introduced!\n",
+      WelsLog (pLogCtx, WELS_LOG_WARNING,
+               "ParseSliceHeaderSyntaxs(), invaild frame number: %d due to IDR frame introduced!",
                pSliceHead->iFrameNum);
       return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_FRAME_NUM);
     }
-    pSliceHead->uiIdrPicId	= BsGetUe (pBs); /* uiIdrPicId */
+    WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //idr_pic_id
+    // standard 7.4.3 idr_pic_id should be in range 0 to 65535, inclusive.
+    WELS_CHECK_SE_UPPER_ERROR (uiCode, SLICE_HEADER_IDR_PIC_ID_MAX, "idr_pic_id", GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER,
+                               ERR_INFO_INVALID_IDR_PIC_ID));
+    pSliceHead->uiIdrPicId	= uiCode; /* uiIdrPicId */
 #ifdef LONG_TERM_REF
     pCtx->uiCurIdrPicId      = pSliceHead->uiIdrPicId;
 #endif
@@ -608,59 +830,67 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
   pSliceHead->iDeltaPicOrderCnt[0]		=
     pSliceHead->iDeltaPicOrderCnt[1]		= 0;
   if (pSps->uiPocType == 0) {
-    pSliceHead->iPicOrderCntLsb	= BsGetBits (pBs, pSps->iLog2MaxPocLsb);
+    WELS_READ_VERIFY (BsGetBits (pBs, pSps->iLog2MaxPocLsb, &uiCode)); //pic_order_cnt_lsb
+    pSliceHead->iPicOrderCntLsb	= uiCode;
     if (pPps->bPicOrderPresentFlag && !pSliceHead->bFieldPicFlag) {
-      pSliceHead->iDeltaPicOrderCntBottom	= BsGetSe (pBs);
+      WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //delta_pic_order_cnt_bottom
+      pSliceHead->iDeltaPicOrderCntBottom	= iCode;
     }
   } else if (pSps->uiPocType == 1 && !pSps->bDeltaPicOrderAlwaysZeroFlag) {
-    pSliceHead->iDeltaPicOrderCnt[0]	= BsGetSe (pBs);
-    if (pPps->bPicOrderPresentFlag && !pSliceHead->bFieldPicFlag)
-      pSliceHead->iDeltaPicOrderCnt[1] = BsGetSe (pBs);
+    WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //delta_pic_order_cnt[ 0 ]
+    pSliceHead->iDeltaPicOrderCnt[0]	= iCode;
+    if (pPps->bPicOrderPresentFlag && !pSliceHead->bFieldPicFlag) {
+      WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //delta_pic_order_cnt[ 1 ]
+      pSliceHead->iDeltaPicOrderCnt[1] = iCode;
+    }
   }
 
   pSliceHead->iRedundantPicCnt	= 0;
   if (pPps->bRedundantPicCntPresentFlag) {
-    pSliceHead->iRedundantPicCnt = BsGetUe (pBs);
+    WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //redundant_pic_cnt
+    // standard section 7.4.3, redundant_pic_cnt should be in range 0 to 127, inclusive.
+    WELS_CHECK_SE_UPPER_ERROR (uiCode, SLICE_HEADER_REDUNDANT_PIC_CNT_MAX, "redundant_pic_cnt",
+                               GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_REDUNDANT_PIC_CNT));
+    pSliceHead->iRedundantPicCnt = uiCode;
   }
 
   //set defaults, might be overriden a few line later
   pSliceHead->uiRefCount[0]	= pPps->uiNumRefIdxL0Active;
   pSliceHead->uiRefCount[1]	= pPps->uiNumRefIdxL1Active;
+
+  bool bReadNumRefFlag = (P_SLICE == uiSliceType);
   if (kbExtensionFlag) {
-    uiQualityId = pNalHeaderExt->uiQualityId;
-    if (BASE_QUALITY_ID == uiQualityId && (EP_SLICE == uiSliceType || EB_SLICE == uiSliceType)) {
-      const bool_t kbBipredFlag = (EB_SLICE == uiSliceType);
-      if (kbBipredFlag) {
-        WelsLog (pCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): kbBipredFlag = 1 not supported.\n");
-        return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_BIPRED);
-      }
-      pSliceHead->bNumRefIdxActiveOverrideFlag	= !!BsGetOneBit (pBs);
-      if (pSliceHead->bNumRefIdxActiveOverrideFlag) {
-        pSliceHead->uiRefCount[0]	= 1 + BsGetUe (pBs);
-      }
-    }
-  } else if (uiSliceType == P_SLICE || uiSliceType == SP_SLICE || uiSliceType == B_SLICE) {
-    const bool_t kbBipredFlag = (B_SLICE == uiSliceType);
-    if (kbBipredFlag) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): kbBipredFlag = 1 not supported.\n");
-      return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_BIPRED);
-    }
-    pSliceHead->bNumRefIdxActiveOverrideFlag	= !!BsGetOneBit (pBs);
+    bReadNumRefFlag &= (BASE_QUALITY_ID == pNalHeaderExt->uiQualityId);
+  }
+  if (bReadNumRefFlag) {
+    WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //num_ref_idx_active_override_flag
+    pSliceHead->bNumRefIdxActiveOverrideFlag	= !!uiCode;
     if (pSliceHead->bNumRefIdxActiveOverrideFlag) {
-      pSliceHead->uiRefCount[0]	= 1 + BsGetUe (pBs);
+      WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //num_ref_idx_l0_active_minus1
+      WELS_CHECK_SE_UPPER_ERROR (uiCode, MAX_NUM_REF_IDX_L0_ACTIVE_MINUS1, "num_ref_idx_l0_active_minus1",
+                                 GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_NUM_REF_IDX_L0_ACTIVE_MINUS1));
+      pSliceHead->uiRefCount[0]	= 1 + uiCode;
     }
   }
 
   if (pSliceHead->uiRefCount[0] > MAX_REF_PIC_COUNT || pSliceHead->uiRefCount[1] > MAX_REF_PIC_COUNT) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "reference overflow\n");
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "reference overflow");
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_REF_COUNT_OVERFLOW);
   }
 
   if (BASE_QUALITY_ID == uiQualityId) {
     iRet = ParseRefPicListReordering (pBs, pSliceHead);
     if (iRet != ERR_NONE) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "invalid ref pPic list reordering syntaxs!\n");
+      WelsLog (pLogCtx, WELS_LOG_WARNING, "invalid ref pPic list reordering syntaxs!");
       return iRet;
+    }
+
+    if (pPps->bWeightedPredFlag && (uiSliceType == P_SLICE)) {
+      iRet = ParsePredWeightedTable (pBs, pSliceHead);
+      if (iRet != ERR_NONE) {
+        WelsLog (pLogCtx, WELS_LOG_WARNING, "invalid weighted prediction syntaxs!");
+        return iRet;
+      }
     }
 
     if (kbExtensionFlag) {
@@ -677,10 +907,11 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
       }
 
       if (kbExtensionFlag && !pSubsetSps->sSpsSvcExt.bSliceHeaderRestrictionFlag) {
-        pSliceHeadExt->bStoreRefBasePicFlag	= !!BsGetOneBit (pBs);
+        WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //store_ref_base_pic_flag
+        pSliceHeadExt->bStoreRefBasePicFlag	= !!uiCode;
         if ((pNalHeaderExt->bUseRefBasePicFlag || pSliceHeadExt->bStoreRefBasePicFlag) && !bIdrFlag) {
-          WelsLog (pCtx, WELS_LOG_WARNING,
-                   "ParseSliceHeaderSyntaxs(): bUseRefBasePicFlag or bStoreRefBasePicFlag = 1 not supported.\n");
+          WelsLog (pLogCtx, WELS_LOG_WARNING,
+                   "ParseSliceHeaderSyntaxs(): bUseRefBasePicFlag or bStoreRefBasePicFlag = 1 not supported.");
           return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_ILP);
         }
       }
@@ -688,21 +919,27 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
   }
 
   if (pPps->bEntropyCodingModeFlag) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "ParseSliceHeaderSyntaxs(): CABAC in Enhancement layer not supported.\n");
-    return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_CABAC_EL);
+    if (pSliceHead->eSliceType != I_SLICE && pSliceHead->eSliceType != SI_SLICE) {
+      WELS_READ_VERIFY (BsGetUe (pBs, &uiCode));
+      pSliceHead->iCabacInitIdc = uiCode;
+      WELS_CHECK_SE_UPPER_ERROR (pSliceHead->iCabacInitIdc, SLICE_HEADER_CABAC_INIT_IDC_MAX, "cabac_init_idc",
+                                 ERR_INFO_INVALID_CABAC_INIT_IDC);
+    } else
+      pSliceHead->iCabacInitIdc = 0;
   }
 
-  pSliceHead->iSliceQpDelta	= BsGetSe (pBs);
+  WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //slice_qp_delta
+  pSliceHead->iSliceQpDelta	= iCode;
   pSliceHead->iSliceQp		= pPps->iPicInitQp + pSliceHead->iSliceQpDelta;
   if (pSliceHead->iSliceQp < 0 || pSliceHead->iSliceQp > 51) {
-    WelsLog (pCtx, WELS_LOG_WARNING, "QP %d out of range\n", pSliceHead->iSliceQp);
+    WelsLog (pLogCtx, WELS_LOG_WARNING, "QP %d out of range", pSliceHead->iSliceQp);
     return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_QP);
   }
 
   //FIXME qscale / qp ... stuff
   if (!kbExtensionFlag) {
     if (uiSliceType == SP_SLICE || uiSliceType == SI_SLICE) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "SP/SI not supported\n");
+      WelsLog (pLogCtx, WELS_LOG_WARNING, "SP/SI not supported");
       return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_SPSI);
     }
   }
@@ -711,16 +948,25 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
   pSliceHead->iSliceAlphaC0Offset			= 0;
   pSliceHead->iSliceBetaOffset				= 0;
   if (pPps->bDeblockingFilterControlPresentFlag) {
-    pSliceHead->uiDisableDeblockingFilterIdc	= BsGetUe (pBs);
+    WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //disable_deblocking_filter_idc
+    pSliceHead->uiDisableDeblockingFilterIdc	= uiCode;
     //refer to JVT-X201wcm1.doc G.7.4.3.4--2010.4.20
     if (pSliceHead->uiDisableDeblockingFilterIdc > 6) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "disable_deblock_filter_idc (%d) out of range [0, 6]\n",
+      WelsLog (pLogCtx, WELS_LOG_WARNING, "disable_deblock_filter_idc (%d) out of range [0, 6]",
                pSliceHead->uiDisableDeblockingFilterIdc);
       return ERR_INFO_INVALID_DBLOCKING_IDC;
     }
     if (pSliceHead->uiDisableDeblockingFilterIdc != 1) {
-      pSliceHead->iSliceAlphaC0Offset	= BsGetSe (pBs) << 1;	// slice_alpha_c0_offset_div2
-      pSliceHead->iSliceBetaOffset		= BsGetSe (pBs) << 1;	// iSliceBetaOffset
+      WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //slice_alpha_c0_offset_div2
+      pSliceHead->iSliceAlphaC0Offset	= iCode * 2;
+      WELS_CHECK_SE_BOTH_ERROR (pSliceHead->iSliceAlphaC0Offset, SLICE_HEADER_ALPHAC0_BETA_OFFSET_MIN,
+                                SLICE_HEADER_ALPHAC0_BETA_OFFSET_MAX, "slice_alpha_c0_offset_div2 * 2", GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER,
+                                    ERR_INFO_INVALID_SLICE_ALPHA_C0_OFFSET_DIV2));
+      WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //slice_beta_offset_div2
+      pSliceHead->iSliceBetaOffset		= iCode * 2;
+      WELS_CHECK_SE_BOTH_ERROR (pSliceHead->iSliceBetaOffset, SLICE_HEADER_ALPHAC0_BETA_OFFSET_MIN,
+                                SLICE_HEADER_ALPHAC0_BETA_OFFSET_MAX, "slice_beta_offset_div2 * 2", GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER,
+                                    ERR_INFO_INVALID_SLICE_BETA_OFFSET_DIV2));
     }
   }
 
@@ -732,7 +978,8 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
     if (pPps->uiSliceGroupChangeRate > 0) {
       const int32_t kiNumBits = (int32_t)WELS_CEIL (log (static_cast<double> (1 + pPps->uiPicSizeInMapUnits /
                                 pPps->uiSliceGroupChangeRate)));
-      pSliceHead->iSliceGroupChangeCycle	= BsGetBits (pBs, kiNumBits);	// For FMO extra types
+      WELS_READ_VERIFY (BsGetBits (pBs, kiNumBits, &uiCode)); //lice_group_change_cycle
+      pSliceHead->iSliceGroupChangeCycle	= uiCode;
     } else
       pSliceHead->iSliceGroupChangeCycle	= 0;
   }
@@ -745,25 +992,37 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
 
     if (!pNalHeaderExt->iNoInterLayerPredFlag && BASE_QUALITY_ID == uiQualityId) {
       //the following should be deleted for CODE_CLEAN
-      pSliceHeadExt->uiRefLayerDqId	= BsGetUe (pBs);
+      WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //ref_layer_dq_id
+      pSliceHeadExt->uiRefLayerDqId	= uiCode;
       if (pSubsetSps->sSpsSvcExt.bInterLayerDeblockingFilterCtrlPresentFlag) {
-        pSliceHeadExt->uiDisableInterLayerDeblockingFilterIdc	= BsGetUe (pBs);
+        WELS_READ_VERIFY (BsGetUe (pBs, &uiCode)); //disable_inter_layer_deblocking_filter_idc
+        pSliceHeadExt->uiDisableInterLayerDeblockingFilterIdc	= uiCode;
         //refer to JVT-X201wcm1.doc G.7.4.3.4--2010.4.20
         if (pSliceHeadExt->uiDisableInterLayerDeblockingFilterIdc > 6) {
-          WelsLog (pCtx, WELS_LOG_WARNING, "disable_inter_layer_deblock_filter_idc (%d) out of range [0, 6]\n",
+          WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING, "disable_inter_layer_deblock_filter_idc (%d) out of range [0, 6]",
                    pSliceHeadExt->uiDisableInterLayerDeblockingFilterIdc);
           return ERR_INFO_INVALID_DBLOCKING_IDC;
         }
         if (pSliceHeadExt->uiDisableInterLayerDeblockingFilterIdc != 1) {
-          pSliceHeadExt->iInterLayerSliceAlphaC0Offset	= BsGetSe (pBs) << 1;
-          pSliceHeadExt->iInterLayerSliceBetaOffset		= BsGetSe (pBs) << 1;
+          WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //inter_layer_slice_alpha_c0_offset_div2
+          pSliceHeadExt->iInterLayerSliceAlphaC0Offset	= iCode * 2;
+          WELS_CHECK_SE_BOTH_ERROR (pSliceHeadExt->iInterLayerSliceAlphaC0Offset,
+                                    SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MIN, SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MAX,
+                                    "inter_layer_alpha_c0_offset_div2 * 2", GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER,
+                                        ERR_INFO_INVALID_SLICE_ALPHA_C0_OFFSET_DIV2));
+          WELS_READ_VERIFY (BsGetSe (pBs, &iCode)); //inter_layer_slice_beta_offset_div2
+          pSliceHeadExt->iInterLayerSliceBetaOffset		= iCode * 2;
+          WELS_CHECK_SE_BOTH_ERROR (pSliceHeadExt->iInterLayerSliceBetaOffset, SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MIN,
+                                    SLICE_HEADER_INTER_LAYER_ALPHAC0_BETA_OFFSET_MAX, "inter_layer_slice_beta_offset_div2 * 2",
+                                    GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_INVALID_SLICE_BETA_OFFSET_DIV2));
         }
       }
 
       pSliceHeadExt->uiRefLayerChromaPhaseXPlus1Flag	= pSubsetSps->sSpsSvcExt.uiSeqRefLayerChromaPhaseXPlus1Flag;
       pSliceHeadExt->uiRefLayerChromaPhaseYPlus1		= pSubsetSps->sSpsSvcExt.uiSeqRefLayerChromaPhaseYPlus1;
 
-      pSliceHeadExt->bConstrainedIntraResamplingFlag	= !!BsGetOneBit (pBs);
+      WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //constrained_intra_resampling_flag
+      pSliceHeadExt->bConstrainedIntraResamplingFlag	= !!uiCode;
 
       {
         SPosOffset pos;
@@ -777,9 +1036,8 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
             (pos.iTopOffset + pos.iBottomOffset) / (1 + pSliceHead->bFieldPicFlag);
       }
     } else if (uiQualityId > BASE_QUALITY_ID) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "MGS not supported.\n");
+      WelsLog (pLogCtx, WELS_LOG_WARNING, "MGS not supported.");
       return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_MGS);
-      pSliceHeadExt->uiRefLayerDqId	= pNalHeaderExt->uiLayerDqId - 1;
     } else {
       pSliceHeadExt->uiRefLayerDqId	= (uint8_t) - 1;
     }
@@ -797,34 +1055,47 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
       pSliceHeadExt->bTCoeffLevelPredFlag	= pSubsetSps->sSpsSvcExt.bSeqTCoeffLevelPredFlag;
 
     if (!pNalHeaderExt->iNoInterLayerPredFlag) {
-      pSliceHeadExt->bSliceSkipFlag	= !!BsGetOneBit (pBs);
+      WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //slice_skip_flag
+      pSliceHeadExt->bSliceSkipFlag	= !!uiCode;
       if (pSliceHeadExt->bSliceSkipFlag) {
-        pSliceHeadExt->uiNumMbsInSlice	= 1 + BsGetUe (pBs);
+        WelsLog (pLogCtx, WELS_LOG_WARNING, "bSliceSkipFlag == 1 not supported.");
+        return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_SLICESKIP);
       } else {
-        pSliceHeadExt->bAdaptiveBaseModeFlag	= !!BsGetOneBit (pBs);
+        WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //adaptive_base_mode_flag
+        pSliceHeadExt->bAdaptiveBaseModeFlag	= !!uiCode;
         if (!pSliceHeadExt->bAdaptiveBaseModeFlag) {
-          pSliceHeadExt->bDefaultBaseModeFlag	= !!BsGetOneBit (pBs);
+          WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //default_base_mode_flag
+          pSliceHeadExt->bDefaultBaseModeFlag	= !!uiCode;
         }
         if (!pSliceHeadExt->bDefaultBaseModeFlag) {
-          pSliceHeadExt->bAdaptiveMotionPredFlag	= !!BsGetOneBit (pBs);
-          if (!pSliceHeadExt->bAdaptiveMotionPredFlag)
-            pSliceHeadExt->bDefaultMotionPredFlag	= !!BsGetOneBit (pBs);
+          WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //adaptive_motion_prediction_flag
+          pSliceHeadExt->bAdaptiveMotionPredFlag	= !!uiCode;
+          if (!pSliceHeadExt->bAdaptiveMotionPredFlag) {
+            WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //default_motion_prediction_flag
+            pSliceHeadExt->bDefaultMotionPredFlag	= !!uiCode;
+          }
         }
 
-        pSliceHeadExt->bAdaptiveResidualPredFlag	= !!BsGetOneBit (pBs);
+        WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //adaptive_residual_prediction_flag
+        pSliceHeadExt->bAdaptiveResidualPredFlag	= !!uiCode;
         if (!pSliceHeadExt->bAdaptiveResidualPredFlag) {
-          pSliceHeadExt->bDefaultResidualPredFlag = !!BsGetOneBit (pBs);
+          WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //default_residual_prediction_flag
+          pSliceHeadExt->bDefaultResidualPredFlag = !!uiCode;
         }
       }
-      if (pSubsetSps->sSpsSvcExt.bAdaptiveTCoeffLevelPredFlag)
-        pSliceHeadExt->bTCoeffLevelPredFlag	= !!BsGetOneBit (pBs);
+      if (pSubsetSps->sSpsSvcExt.bAdaptiveTCoeffLevelPredFlag) {
+        WELS_READ_VERIFY (BsGetOneBit (pBs, &uiCode)); //tcoeff_level_prediction_flag
+        pSliceHeadExt->bTCoeffLevelPredFlag	= !!uiCode;
+      }
     }
 
     if (!pSubsetSps->sSpsSvcExt.bSliceHeaderRestrictionFlag) {
-      pSliceHeadExt->uiScanIdxStart	= BsGetBits (pBs, 4);
-      pSliceHeadExt->uiScanIdxEnd	= BsGetBits (pBs, 4);
+      WELS_READ_VERIFY (BsGetBits (pBs, 4, &uiCode)); //scan_idx_start
+      pSliceHeadExt->uiScanIdxStart	= uiCode;
+      WELS_READ_VERIFY (BsGetBits (pBs, 4, &uiCode)); //scan_idx_end
+      pSliceHeadExt->uiScanIdxEnd	= uiCode;
       if (pSliceHeadExt->uiScanIdxStart != 0 || pSliceHeadExt->uiScanIdxEnd != 15) {
-        WelsLog (pCtx, WELS_LOG_WARNING, "uiScanIdxStart (%d) != 0 and uiScanIdxEnd (%d) !=15 not supported here\n",
+        WelsLog (pLogCtx, WELS_LOG_WARNING, "uiScanIdxStart (%d) != 0 and uiScanIdxEnd (%d) !=15 not supported here",
                  pSliceHeadExt->uiScanIdxStart, pSliceHeadExt->uiScanIdxEnd);
         return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_UNSUPPORTED_MGS);
       }
@@ -842,7 +1113,7 @@ int32_t ParseSliceHeaderSyntaxs (PWelsDecoderContext pCtx, PBitStringAux pBs, co
  *	pSrc:	mark as decoded prefix NAL
  *	ppDst:	succeeded VCL NAL based AVC (I/P Slice)
  */
-bool_t PrefetchNalHeaderExtSyntax (PWelsDecoderContext pCtx, PNalUnit const kppDst, PNalUnit const kpSrc) {
+bool PrefetchNalHeaderExtSyntax (PWelsDecoderContext pCtx, PNalUnit const kppDst, PNalUnit const kpSrc) {
   PNalUnitHeaderExt pNalHdrExtD	= NULL, pNalHdrExtS = NULL;
   PSliceHeaderExt pShExtD = NULL;
   PPrefixNalUnit pPrefixS = NULL;
@@ -901,9 +1172,9 @@ int32_t UpdateAccessUnit (PWelsDecoderContext pCtx) {
 
   // Added for mosaic avoidance, 11/19/2009
 #ifdef LONG_TERM_REF
-  if (pCtx->bParamSetsLostFlag)
+  if (pCtx->bParamSetsLostFlag || pCtx->bNewSeqBegin)
 #else
-  if (pCtx->bReferenceLostAtT0Flag)
+  if (pCtx->bReferenceLostAtT0Flag || pCtx->bNewSeqBegin)
 #endif
   {
     uint32_t uiActualIdx = 0;
@@ -917,14 +1188,20 @@ int32_t UpdateAccessUnit (PWelsDecoderContext pCtx) {
     }
     if (uiActualIdx ==
         pCurAu->uiActualUnitsNum) {	// no found IDR nal within incoming AU, need exit to avoid mosaic issue, 11/19/2009
-      WelsLog (pCtx, WELS_LOG_WARNING, "UpdateAccessUnit():::::Key frame lost.....CAN NOT find IDR from current AU.\n");
-#ifdef LONG_TERM_REF
-      pCtx->iErrorCode |= dsNoParamSets;
-      return dsNoParamSets;
-#else
+
+      pCtx->sDecoderStatistics.uiIDRLostNum++;
+      WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING,
+               "UpdateAccessUnit():::::Key frame lost.....CAN NOT find IDR from current AU.");
       pCtx->iErrorCode |= dsRefLost;
-      return ERR_INFO_REFERENCE_PIC_LOST;
+      if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) {
+#ifdef LONG_TERM_REF
+        pCtx->iErrorCode |= dsNoParamSets;
+        return dsNoParamSets;
+#else
+        pCtx->iErrorCode |= dsRefLost;
+        return ERR_INFO_REFERENCE_PIC_LOST;
 #endif
+      }
     }
   }
 
@@ -932,9 +1209,6 @@ int32_t UpdateAccessUnit (PWelsDecoderContext pCtx) {
 }
 
 int32_t InitialDqLayersContext (PWelsDecoderContext pCtx, const int32_t kiMaxWidth, const int32_t kiMaxHeight) {
-  const int32_t kiPicStride		= ((kiMaxWidth + 15) & 0xfffff0) + (PADDING_LENGTH << 1);
-  const int32_t kiPicLines		= ((kiMaxHeight + 15) & 0xfffff0);
-
   int32_t i = 0;
 
   WELS_VERIFY_RETURN_IF (ERR_INFO_INVALID_PARAM, (NULL == pCtx || kiMaxWidth <= 0 || kiMaxHeight <= 0))
@@ -949,100 +1223,89 @@ int32_t InitialDqLayersContext (PWelsDecoderContext pCtx, const int32_t kiMaxWid
   UninitialDqLayersContext (pCtx);
 
   do {
-    PDqLayer pDq = (PDqLayer)WelsMalloc (sizeof (SDqLayer), "PDqLayer");
-
-    int32_t iPlaneIdx = 0;
+    PDqLayer pDq = (PDqLayer)WelsMallocz (sizeof (SDqLayer), "PDqLayer");
 
     if (pDq == NULL)
       return ERR_INFO_OUT_OF_MEMORY;
 
     memset (pDq, 0, sizeof (SDqLayer));
-    if (pCtx->iDecoderMode == SW_MODE) {
 
-      do {
-        const int32_t kiHshift	= iPlaneIdx ? 1 : 0;
-        const int32_t kiVshift	= kiHshift;
-        const int32_t kiStride	= WELS_ALIGN ((kiPicStride >> kiHshift), (16 << (1 - kiHshift)));
-        const int32_t kiLine	= (kiPicLines + (PADDING_LENGTH << 1)) >> kiVshift;
-        const int32_t kiSize	= kiStride * kiLine;
+    pCtx->sMb.pMbType[i] = (int16_t*)WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int16_t),
+                           "pCtx->sMb.pMbType[]");
+    pCtx->sMb.pMv[i][0] = (int16_t (*)[16][2])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
+                            int16_t) * MV_A * MB_BLOCK4x4_NUM, "pCtx->sMb.pMv[][]");
+    pCtx->sMb.pRefIndex[i][0] = (int8_t (*)[MB_BLOCK4x4_NUM])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
+                                sizeof (
+                                  int8_t) * MB_BLOCK4x4_NUM, "pCtx->sMb.pRefIndex[][]");
+    pCtx->sMb.pLumaQp[i] = (int8_t*)WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
+                           "pCtx->sMb.pLumaQp[]");
+    pCtx->sMb.pChromaQp[i] = (int8_t (*)[2])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 2,
+                             "pCtx->sMb.pChromaQp[]");
+    pCtx->sMb.pMvd[i][0] = (int16_t (*)[16][2])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
+                             int16_t) * MV_A * MB_BLOCK4x4_NUM, "pCtx->sMb.pMvd[][]");
+    pCtx->sMb.pCbfDc[i] = (uint8_t*)WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (uint8_t),
+                          "pCtx->sMb.pCbfDc[]");
+    pCtx->sMb.pNzc[i] = (int8_t (*)[24])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 24,
+                        "pCtx->sMb.pNzc[]");
+    pCtx->sMb.pNzcRs[i] = (int8_t (*)[24])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 24,
+                          "pCtx->sMb.pNzcRs[]");
+    pCtx->sMb.pScaledTCoeff[i] = (int16_t (*)[MB_COEFF_LIST_SIZE])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
+                                 sizeof (int16_t) * MB_COEFF_LIST_SIZE, "pCtx->sMb.pScaledTCoeff[]");
+    pCtx->sMb.pIntraPredMode[i] = (int8_t (*)[8])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
+                                    int8_t) * 8,
+                                  "pCtx->sMb.pIntraPredMode[]");
+    pCtx->sMb.pIntra4x4FinalMode[i] = (int8_t (*)[MB_BLOCK4x4_NUM])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
+                                      sizeof (int8_t) * MB_BLOCK4x4_NUM, "pCtx->sMb.pIntra4x4FinalMode[]");
+    pCtx->sMb.pChromaPredMode[i] = (int8_t*)WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
+                                   "pCtx->sMb.pChromaPredMode[]");
+    pCtx->sMb.pCbp[i] = (int8_t*)WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
+                        "pCtx->sMb.pCbp[]");
+    pCtx->sMb.pSubMbType[i] = (int8_t (*)[MB_PARTITION_SIZE])WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
+                              sizeof (
+                                int8_t) * MB_PARTITION_SIZE, "pCtx->sMb.pSubMbType[]");
+    pCtx->sMb.pSliceIdc[i] = (int32_t*) WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int32_t),
+                             "pCtx->sMb.pSliceIdc[]");	// using int32_t for slice_idc, 4/21/2010
+    pCtx->sMb.pResidualPredFlag[i] = (int8_t*) WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
+                                     "pCtx->sMb.pResidualPredFlag[]");
+    //pCtx->sMb.pMotionPredFlag[i] = (uint8_t *) WelsMallocz(pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof(uint8_t), "pCtx->sMb.pMotionPredFlag[]");
+    pCtx->sMb.pInterPredictionDoneFlag[i] = (int8_t*) WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
+        int8_t), "pCtx->sMb.pInterPredictionDoneFlag[]");
 
-        pCtx->pCsListXchg[i][iPlaneIdx]	= (uint8_t*)WelsMalloc (kiSize * sizeof (uint8_t), "pCtx->pCsListXchg[][]");
+    pCtx->sMb.pMbCorrectlyDecodedFlag[i] = (bool*) WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (bool),
+                                           "pCtx->sMb.pMbCorrectlyDecodedFlag[]");
+    pCtx->sMb.pMbRefConcealedFlag[i] = (bool*) WelsMallocz (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (bool),
+                                       "pCtx->pMbRefConcealedFlag[]");
 
-        WELS_VERIFY_RETURN_IF (ERR_INFO_OUT_OF_MEMORY, (NULL == pCtx->pCsListXchg[i][iPlaneIdx]))
-        pCtx->iCsStride[iPlaneIdx]	= kiStride;
+    // check memory block valid due above allocated..
+    WELS_VERIFY_RETURN_IF (ERR_INFO_OUT_OF_MEMORY,
+                           ((NULL == pCtx->sMb.pMbType[i]) ||
+                            (NULL == pCtx->sMb.pMv[i][0]) ||
+                            (NULL == pCtx->sMb.pRefIndex[i][0]) ||
+                            (NULL == pCtx->sMb.pLumaQp[i]) ||
+                            (NULL == pCtx->sMb.pChromaQp[i]) ||
+                            (NULL == pCtx->sMb.pMvd[i][0]) ||
+                            (NULL == pCtx->sMb.pCbfDc[i]) ||
+                            (NULL == pCtx->sMb.pNzc[i]) ||
+                            (NULL == pCtx->sMb.pNzcRs[i]) ||
+                            (NULL == pCtx->sMb.pScaledTCoeff[i]) ||
+                            (NULL == pCtx->sMb.pIntraPredMode[i]) ||
+                            (NULL == pCtx->sMb.pIntra4x4FinalMode[i]) ||
+                            (NULL == pCtx->sMb.pChromaPredMode[i]) ||
+                            (NULL == pCtx->sMb.pCbp[i]) ||
+                            (NULL == pCtx->sMb.pSubMbType[i]) ||
+                            (NULL == pCtx->sMb.pSliceIdc[i]) ||
+                            (NULL == pCtx->sMb.pResidualPredFlag[i]) ||
+                            (NULL == pCtx->sMb.pInterPredictionDoneFlag[i]) ||
+                            (NULL == pCtx->sMb.pMbRefConcealedFlag[i]) ||
+                            (NULL == pCtx->sMb.pMbCorrectlyDecodedFlag[i])
+                           )
+                          )
 
-
-        pCtx->pRsListXchg[i][iPlaneIdx]	= (int16_t*)WelsMalloc (kiSize * sizeof (int16_t), "pCtx->pRsListXchg[][]");
-
-        WELS_VERIFY_RETURN_IF (ERR_INFO_OUT_OF_MEMORY , (NULL == pCtx->pRsListXchg[i][iPlaneIdx]))
-        pCtx->iRsStride[iPlaneIdx]	= kiStride;
-
-        ++ iPlaneIdx;
-      } while (iPlaneIdx < 3);
-
-
-      pCtx->sMb.pMbType[i] = (int8_t*)WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                             "pCtx->sMb.pMbType[]");
-      pCtx->sMb.pMv[i][0] = (int16_t (*)[16][2])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
-                              int16_t) * MV_A * MB_BLOCK4x4_NUM, "pCtx->sMb.pMv[][]");
-      pCtx->sMb.pRefIndex[i][0] = (int8_t (*)[MB_BLOCK4x4_NUM])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
-                                    int8_t) * MB_BLOCK4x4_NUM, "pCtx->sMb.pRefIndex[][]");
-      pCtx->sMb.pLumaQp[i] = (int8_t*)WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                             "pCtx->sMb.pLumaQp[]");
-      pCtx->sMb.pChromaQp[i] = (int8_t*)WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                               "pCtx->sMb.pChromaQp[]");
-      pCtx->sMb.pNzc[i] = (int8_t (*)[24])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 24,
-                          "pCtx->sMb.pNzc[]");
-      pCtx->sMb.pNzcRs[i] = (int8_t (*)[24])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 24,
-                            "pCtx->sMb.pNzcRs[]");
-      pCtx->sMb.pScaledTCoeff[i] = (int16_t (*)[MB_COEFF_LIST_SIZE])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
-                                   sizeof (int16_t) * MB_COEFF_LIST_SIZE, "pCtx->sMb.pScaledTCoeff[]");
-      pCtx->sMb.pIntraPredMode[i] = (int8_t (*)[8])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t) * 8,
-                                    "pCtx->sMb.pIntraPredMode[]");
-      pCtx->sMb.pIntra4x4FinalMode[i] = (int8_t (*)[MB_BLOCK4x4_NUM])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight *
-                                        sizeof (int8_t) * MB_BLOCK4x4_NUM, "pCtx->sMb.pIntra4x4FinalMode[]");
-      pCtx->sMb.pChromaPredMode[i] = (int8_t*)WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                                     "pCtx->sMb.pChromaPredMode[]");
-      pCtx->sMb.pCbp[i] = (int8_t*)WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                          "pCtx->sMb.pCbp[]");
-      pCtx->sMb.pSubMbType[i] = (int8_t (*)[MB_PARTITION_SIZE])WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
-                                  int8_t) * MB_PARTITION_SIZE, "pCtx->sMb.pSubMbType[]");
-      pCtx->sMb.pSliceIdc[i] = (int32_t*) WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int32_t),
-                               "pCtx->sMb.pSliceIdc[]");	// using int32_t for slice_idc, 4/21/2010
-      if (pCtx->sMb.pSliceIdc[i] != NULL)
-        memset (pCtx->sMb.pSliceIdc[i], 0xff, (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int32_t)));
-      pCtx->sMb.pResidualPredFlag[i] = (int8_t*) WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int8_t),
-                                       "pCtx->sMb.pResidualPredFlag[]");
-      //pCtx->sMb.pMotionPredFlag[i] = (uint8_t *) WelsMalloc(pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof(uint8_t), "pCtx->sMb.pMotionPredFlag[]");
-      pCtx->sMb.pInterPredictionDoneFlag[i] = (int8_t*) WelsMalloc (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (
-          int8_t), "pCtx->sMb.pInterPredictionDoneFlag[]");
-
-      // check memory block valid due above allocated..
-      WELS_VERIFY_RETURN_IF (ERR_INFO_OUT_OF_MEMORY,
-                             ((NULL == pCtx->sMb.pMbType[i]) ||
-                              (NULL == pCtx->sMb.pMv[i][0]) ||
-                              (NULL == pCtx->sMb.pRefIndex[i][0]) ||
-                              (NULL == pCtx->sMb.pLumaQp[i]) ||
-                              (NULL == pCtx->sMb.pChromaQp[i]) ||
-                              (NULL == pCtx->sMb.pNzc[i]) ||
-                              (NULL == pCtx->sMb.pNzcRs[i]) ||
-                              (NULL == pCtx->sMb.pScaledTCoeff[i]) ||
-                              (NULL == pCtx->sMb.pIntraPredMode[i]) ||
-                              (NULL == pCtx->sMb.pIntra4x4FinalMode[i]) ||
-                              (NULL == pCtx->sMb.pChromaPredMode[i]) ||
-                              (NULL == pCtx->sMb.pCbp[i]) ||
-                              (NULL == pCtx->sMb.pSubMbType[i]) ||
-                              (NULL == pCtx->sMb.pSliceIdc[i]) ||
-                              (NULL == pCtx->sMb.pResidualPredFlag[i]) ||
-                              (NULL == pCtx->sMb.pInterPredictionDoneFlag[i])
-                             )
-                            )
-    } // end of if(pCtx->iDecoderMode == SW_MODE)
+    memset (pCtx->sMb.pSliceIdc[i], 0xff, (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int32_t)));
 
     pCtx->pDqLayersList[i] = pDq;
     ++ i;
   } while (i < LAYER_NUM_EXCHANGEABLE);
-
 
   pCtx->bInitialDqLayersMem	= true;
   pCtx->iPicWidthReq			= kiMaxWidth;
@@ -1051,43 +1314,14 @@ int32_t InitialDqLayersContext (PWelsDecoderContext pCtx, const int32_t kiMaxWid
   return ERR_NONE;
 }
 
-void_t UninitialDqLayersContext (PWelsDecoderContext pCtx) {
+void UninitialDqLayersContext (PWelsDecoderContext pCtx) {
   int32_t i = 0;
-  int32_t j = 0;
 
   do {
     PDqLayer pDq = pCtx->pDqLayersList[i];
     if (pDq == NULL) {
       ++ i;
       continue;
-    }
-
-    if (pCtx->pCsListXchg[i]) {	// cs picture
-      j = 0;
-      do {
-        if (NULL != pCtx->pCsListXchg[i][j]) {
-          WelsFree (pCtx->pCsListXchg[i][j], "pCtx->pCsListXchg[][]");
-
-          pCtx->pCsListXchg[i][j] = NULL;
-        }
-        pCtx->iCsStride[j]	= 0;
-        ++ j;
-      } while (j < 3);
-
-      pDq->pCsData[i]		= NULL;	// for safe
-      pDq->iCsStride[i]	= 0;
-    }
-    if (pCtx->pRsListXchg[i]) {
-      j = 0;
-      do {
-        if (NULL != pCtx->pRsListXchg[i][j]) {
-          WelsFree (pCtx->pRsListXchg[i][j], "pCtx->pRsListXchg[][]");
-
-          pCtx->pRsListXchg[i][j]	= NULL;
-        }
-        pCtx->iRsStride[j]	= 0;
-        ++ j;
-      } while (j < 3);
     }
 
     if (pCtx->sMb.pMbType[i]) {
@@ -1118,6 +1352,16 @@ void_t UninitialDqLayersContext (PWelsDecoderContext pCtx) {
       WelsFree (pCtx->sMb.pChromaQp[i], "pCtx->sMb.pChromaQp[]");
 
       pCtx->sMb.pChromaQp[i] = NULL;
+    }
+
+    if (pCtx->sMb.pMvd[i][0]) {
+      WelsFree (pCtx->sMb.pMvd[i][0], "pCtx->sMb.pMvd[][]");
+      pCtx->sMb.pMvd[i][0] = NULL;
+    }
+
+    if (pCtx->sMb.pCbfDc[i]) {
+      WelsFree (pCtx->sMb.pCbfDc[i], "pCtx->sMb.pCbfDc[]");
+      pCtx->sMb.pCbfDc[i] = NULL;
     }
 
     if (pCtx->sMb.pNzc[i]) {
@@ -1192,6 +1436,16 @@ void_t UninitialDqLayersContext (PWelsDecoderContext pCtx) {
 
       pCtx->sMb.pInterPredictionDoneFlag[i] = NULL;
     }
+
+    if (pCtx->sMb.pMbCorrectlyDecodedFlag[i]) {
+      WelsFree (pCtx->sMb.pMbCorrectlyDecodedFlag[i], "pCtx->sMb.pMbCorrectlyDecodedFlag[]");
+      pCtx->sMb.pMbCorrectlyDecodedFlag[i] = NULL;
+    }
+
+    if (pCtx->sMb.pMbRefConcealedFlag[i]) {
+      WelsFree (pCtx->sMb.pMbRefConcealedFlag[i], "pCtx->sMb.pMbRefConcealedFlag[]");
+      pCtx->sMb.pMbRefConcealedFlag[i] = NULL;
+    }
     WelsFree (pDq, "pDq");
 
     pDq = NULL;
@@ -1205,9 +1459,9 @@ void_t UninitialDqLayersContext (PWelsDecoderContext pCtx) {
   pCtx->bInitialDqLayersMem	= false;
 }
 
-void_t ResetCurrentAccessUnit (PWelsDecoderContext pCtx) {
+void ResetCurrentAccessUnit (PWelsDecoderContext pCtx) {
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
-
+  pCurAu->uiStartPos            = 0;
   pCurAu->uiEndPos		= 0;
   pCurAu->bCompletedAuFlag	= false;
   if (pCurAu->uiActualUnitsNum > 0) {
@@ -1233,7 +1487,7 @@ void_t ResetCurrentAccessUnit (PWelsDecoderContext pCtx) {
  * \author
  * \history	11/16/2009
  */
-void_t ForceResetCurrentAccessUnit (PAccessUnit pAu) {
+void ForceResetCurrentAccessUnit (PAccessUnit pAu) {
   uint32_t uiSucAuIdx	= pAu->uiEndPos + 1;
   uint32_t uiCurAuIdx	= 0;
 
@@ -1252,18 +1506,31 @@ void_t ForceResetCurrentAccessUnit (PAccessUnit pAu) {
   else
     pAu->uiAvailUnitsNum	= 0;
   pAu->uiActualUnitsNum	= 0;
+  pAu->uiStartPos       = 0;
   pAu->uiEndPos		= 0;
   pAu->bCompletedAuFlag	= false;
 }
 
 //clear current corrupted NAL from pNalUnitsList
-void_t ForceClearCurrentNal (PAccessUnit pAu) {
+void ForceClearCurrentNal (PAccessUnit pAu) {
   if (pAu->uiAvailUnitsNum > 0)
     -- pAu->uiAvailUnitsNum;
 }
 
+void ForceResetParaSetStatusAndAUList (PWelsDecoderContext pCtx) {
+  pCtx->bSpsExistAheadFlag = false;
+  pCtx->bSubspsExistAheadFlag = false;
+  pCtx->bPpsExistAheadFlag = false;
 
-void_t CheckAvailNalUnitsListContinuity (PWelsDecoderContext pCtx, int32_t iStartIdx, int32_t iEndIdx) {
+  // Force clear the AU list
+  pCtx->pAccessUnitList->uiAvailUnitsNum	= 0;
+  pCtx->pAccessUnitList->uiActualUnitsNum	= 0;
+  pCtx->pAccessUnitList->uiStartPos		= 0;
+  pCtx->pAccessUnitList->uiEndPos		= 0;
+  pCtx->pAccessUnitList->bCompletedAuFlag	= false;
+}
+
+void CheckAvailNalUnitsListContinuity (PWelsDecoderContext pCtx, int32_t iStartIdx, int32_t iEndIdx) {
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
 
   uint8_t uiLastNuDependencyId, uiLastNuLayerDqId;
@@ -1306,7 +1573,7 @@ void_t CheckAvailNalUnitsListContinuity (PWelsDecoderContext pCtx, int32_t iStar
 
 //main purpose: to support multi-slice and to include all slice which have the same uiDependencyId, uiQualityId and frame_num
 //for single slice, pIdxNoInterLayerPred SHOULD NOT be modified
-void_t RefineIdxNoInterLayerPred (PAccessUnit pCurAu, int32_t* pIdxNoInterLayerPred) {
+void RefineIdxNoInterLayerPred (PAccessUnit pCurAu, int32_t* pIdxNoInterLayerPred) {
   int32_t iLastNalDependId  = pCurAu->pNalUnitsList[*pIdxNoInterLayerPred]->sNalHeaderExt.uiDependencyId;
   int32_t iLastNalQualityId = pCurAu->pNalUnitsList[*pIdxNoInterLayerPred]->sNalHeaderExt.uiQualityId;
   uint8_t uiLastNalTId       = pCurAu->pNalUnitsList[*pIdxNoInterLayerPred]->sNalHeaderExt.uiTemporalId;
@@ -1319,7 +1586,7 @@ void_t RefineIdxNoInterLayerPred (PAccessUnit pCurAu, int32_t* pIdxNoInterLayerP
   int32_t iCurNalDependId, iCurNalQualityId, iCurNalTId, iCurNalFrameNum, iCurNalPoc, iCurNalFirstMb, iCurIdx,
           iFinalIdxNoInterLayerPred;
 
-  bool_t  bMultiSliceFind = false;
+  bool  bMultiSliceFind = false;
 
   iFinalIdxNoInterLayerPred = 0;
   iCurIdx = *pIdxNoInterLayerPred - 1;
@@ -1354,7 +1621,7 @@ void_t RefineIdxNoInterLayerPred (PAccessUnit pCurAu, int32_t* pIdxNoInterLayerP
   }
 }
 
-bool_t CheckPocOfCurValidNalUnits (PAccessUnit pCurAu, int32_t pIdxNoInterLayerPred) {
+bool CheckPocOfCurValidNalUnits (PAccessUnit pCurAu, int32_t pIdxNoInterLayerPred) {
   int32_t iEndIdx    = pCurAu->uiEndPos;
   int32_t iCurAuPoc =
     pCurAu->pNalUnitsList[pIdxNoInterLayerPred]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iPicOrderCntLsb;
@@ -1369,20 +1636,15 @@ bool_t CheckPocOfCurValidNalUnits (PAccessUnit pCurAu, int32_t pIdxNoInterLayerP
   return true;
 }
 
-bool_t CheckIntegrityNalUnitsList (PWelsDecoderContext pCtx) {
+bool CheckIntegrityNalUnitsList (PWelsDecoderContext pCtx) {
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
   const int32_t kiEndPos = pCurAu->uiEndPos;
   int32_t iIdxNoInterLayerPred = 0;
-  int32_t iCurNalUnitIdx = kiEndPos;
-
-  ESliceType eSliceType = static_cast<ESliceType> (0);//EC 2009.11.12
 
   if (!pCurAu->bCompletedAuFlag)
     return false;
 
-  eSliceType = pCurAu->pNalUnitsList[iCurNalUnitIdx]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.eSliceType;
-
-  if (I_SLICE == eSliceType) {
+  if (pCtx->bNewSeqBegin) {
     pCurAu->uiStartPos = 0;
     //step1: search the pNalUnit whose iNoInterLayerPredFlag equal to 1 backwards (from uiEndPos to 0)
     iIdxNoInterLayerPred = kiEndPos;
@@ -1413,7 +1675,7 @@ bool_t CheckIntegrityNalUnitsList (PWelsDecoderContext pCtx) {
       pCurAu->pNalUnitsList[pCurAu->uiEndPos]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iMbHeight << 4;
   } else { //P_SLICE
     //step 1: search uiDependencyId equal to pCtx->cur_seq_interval_target_dependency_id
-    bool_t bGetDependId = false;
+    bool bGetDependId = false;
     int32_t iIdxDependId = 0;
 
     iIdxDependId = kiEndPos;
@@ -1428,7 +1690,7 @@ bool_t CheckIntegrityNalUnitsList (PWelsDecoderContext pCtx) {
 
     //step 2: switch according to whether or not find the index of pNalUnit whose uiDependencyId equal to iCurSeqIntervalTargetDependId
     if (bGetDependId) { //get the index of pNalUnit whose uiDependencyId equal to iCurSeqIntervalTargetDependId
-      bool_t bGetNoInterPredFront = false;
+      bool bGetNoInterPredFront = false;
       //step 2a: search iNoInterLayerPredFlag [0....iIdxDependId]
       iIdxNoInterLayerPred = iIdxDependId;
       while (iIdxNoInterLayerPred >= 0) {
@@ -1493,7 +1755,7 @@ bool_t CheckIntegrityNalUnitsList (PWelsDecoderContext pCtx) {
   return true;
 }
 
-void_t CheckOnlyOneLayerInAu (PWelsDecoderContext pCtx) {
+void CheckOnlyOneLayerInAu (PWelsDecoderContext pCtx) {
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
 
   int32_t iEndIdx = pCurAu->uiEndPos;
@@ -1546,31 +1808,97 @@ int32_t WelsDecodeAccessUnitStart (PWelsDecoderContext pCtx) {
   return ERR_NONE;
 }
 
-void_t WelsDecodeAccessUnitEnd (PWelsDecoderContext pCtx) {
+void WelsDecodeAccessUnitEnd (PWelsDecoderContext pCtx) {
+  //save previous header info
+  PAccessUnit pCurAu = pCtx->pAccessUnitList;
+  PNalUnit pCurNal = pCurAu->pNalUnitsList[pCurAu->uiEndPos];
+  memcpy (&pCtx->sLastNalHdrExt, &pCurNal->sNalHeaderExt, sizeof (SNalUnitHeaderExt));
+  memcpy (&pCtx->sLastSliceHeader,
+          &pCurNal->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader, sizeof (SSliceHeader));
   // uninitialize context of current access unit and rbsp buffer clean
   ResetCurrentAccessUnit (pCtx);
 }
 
-
-int32_t CheckBSBound (int32_t iWidth, int32_t iHeight, int32_t sliceNum, int32_t ppsId) {
-  int32_t iRet = 0;
-
-#if defined(_WIN32)
-  iRet = ((iWidth == 80) && (iHeight = 45) && (sliceNum < 60));
-
-#elif defined(MACOS)
-  iRet = ((iWidth == 80) && (iHeight = 45) && (ppsId < 57));
-
-#elif defined(ANDROID)
-  iRet = ((iWidth == 40) && (iHeight = 22));
-
-#endif
-
-  return iRet;
-
+/* CheckNewSeqBeginAndUpdateActiveLayerSps
+ * return:
+ * true - the AU to be construct is the start of new sequence; false - not
+ */
+static bool CheckNewSeqBeginAndUpdateActiveLayerSps (PWelsDecoderContext pCtx) {
+  bool bNewSeq = false;
+  PAccessUnit pCurAu = pCtx->pAccessUnitList;
+  PSps pTmpLayerSps[MAX_LAYER_NUM];
+  for (int i = 0; i < MAX_LAYER_NUM; i++) {
+    pTmpLayerSps[i] = NULL;
+  }
+  // track the layer sps for the current au
+  for (unsigned int i = pCurAu->uiStartPos; i <= pCurAu->uiEndPos; i++) {
+    uint32_t uiDid = pCurAu->pNalUnitsList[i]->sNalHeaderExt.uiDependencyId;
+    pTmpLayerSps[uiDid] = pCurAu->pNalUnitsList[i]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.pSps;
+    if ((pCurAu->pNalUnitsList[i]->sNalHeaderExt.sNalUnitHeader.eNalUnitType == NAL_UNIT_CODED_SLICE_IDR)
+        || (pCurAu->pNalUnitsList[i]->sNalHeaderExt.bIdrFlag))
+      bNewSeq = true;
+  }
+  int iMaxActiveLayer = 0, iMaxCurrentLayer = 0;
+  for (int i = MAX_LAYER_NUM - 1; i >= 0; i--) {
+    if (pCtx->pActiveLayerSps[i] != NULL) {
+      iMaxActiveLayer = i;
+      break;
+    }
+  }
+  for (int i = MAX_LAYER_NUM - 1; i >= 0; i--) {
+    if (pTmpLayerSps[i] != NULL) {
+      iMaxCurrentLayer = i;
+      break;
+    }
+  }
+  if ((iMaxCurrentLayer != iMaxActiveLayer)
+      || (pTmpLayerSps[iMaxCurrentLayer]  != pCtx->pActiveLayerSps[iMaxActiveLayer])) {
+    bNewSeq = true;
+  }
+  // fill active sps if the current sps is not null while active layer is null
+  if (!bNewSeq) {
+    for (int i = 0; i < MAX_LAYER_NUM; i++) {
+      if (pCtx->pActiveLayerSps[i] == NULL && pTmpLayerSps[i] != NULL) {
+        pCtx->pActiveLayerSps[i] = pTmpLayerSps[i];
+      }
+    }
+  } else {
+    // UpdateActiveLayerSps if new sequence start
+    memcpy (&pCtx->pActiveLayerSps[0], &pTmpLayerSps[0], MAX_LAYER_NUM * sizeof (PSps));
+  }
+  return bNewSeq;
 }
 
+static void WriteBackActiveParameters (PWelsDecoderContext pCtx) {
+  if (pCtx->iOverwriteFlags & OVERWRITE_PPS) {
+    memcpy (&pCtx->sPpsBuffer[pCtx->sPpsBuffer[MAX_PPS_COUNT].iPpsId], &pCtx->sPpsBuffer[MAX_PPS_COUNT], sizeof (SPps));
+  }
+  if (pCtx->iOverwriteFlags & OVERWRITE_SPS) {
+    memcpy (&pCtx->sSpsBuffer[pCtx->sSpsBuffer[MAX_SPS_COUNT].iSpsId], &pCtx->sSpsBuffer[MAX_SPS_COUNT], sizeof (SSps));
+    pCtx->bNewSeqBegin = true;
+  }
+  if (pCtx->iOverwriteFlags & OVERWRITE_SUBSETSPS) {
+    memcpy (&pCtx->sSubsetSpsBuffer[pCtx->sSubsetSpsBuffer[MAX_SPS_COUNT].sSps.iSpsId],
+            &pCtx->sSubsetSpsBuffer[MAX_SPS_COUNT], sizeof (SSubsetSps));
+    pCtx->bNewSeqBegin = true;
+  }
+  pCtx->iOverwriteFlags = OVERWRITE_NONE;
+}
 
+/*
+ * DecodeFinishUpdate
+ * decoder finish decoding, update active parameter sets and new seq status
+ *
+ */
+
+void DecodeFinishUpdate (PWelsDecoderContext pCtx) {
+  pCtx->bNewSeqBegin = false;
+  WriteBackActiveParameters (pCtx);
+  pCtx->bNewSeqBegin = pCtx->bNewSeqBegin || pCtx->bNextNewSeqBegin;
+  pCtx->bNextNewSeqBegin = false; // reset it
+  if (pCtx->bNewSeqBegin)
+    ResetActiveSPSForEachLayer (pCtx);
+}
 
 /*
  * ConstructAccessUnit
@@ -1586,57 +1914,52 @@ int32_t CheckBSBound (int32_t iWidth, int32_t iHeight, int32_t sliceNum, int32_t
  */
 int32_t ConstructAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, SBufferInfo* pDstInfo) {
   int32_t iErr;
-  int32_t iWidth;
-  int32_t iHeight;
-  int32_t iStride[2] = { 0 };
-
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
-
   pCtx->bAuReadyFlag = false;
   pCtx->bLastHasMmco5 = false;
-
+  bool bTmpNewSeqBegin = CheckNewSeqBeginAndUpdateActiveLayerSps (pCtx);
+  pCtx->bNewSeqBegin = pCtx->bNewSeqBegin || bTmpNewSeqBegin;
   iErr = WelsDecodeAccessUnitStart (pCtx);
   GetVclNalTemporalId (pCtx);
 
   if (ERR_NONE != iErr) {
     ForceResetCurrentAccessUnit (pCtx->pAccessUnitList);
-    pDstInfo->iBufferStatus = 0;
+    if (!pCtx->bParseOnly)
+      pDstInfo->iBufferStatus = 0;
+    pCtx->bNewSeqBegin = pCtx->bNewSeqBegin || pCtx->bNextNewSeqBegin;
+    pCtx->bNextNewSeqBegin = false; // reset it
+    if (pCtx->bNewSeqBegin)
+      ResetActiveSPSForEachLayer (pCtx);
     return iErr;
   }
 
   pCtx->pSps = pCurAu->pNalUnitsList[pCurAu->uiStartPos]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.pSps;
   pCtx->pPps = pCurAu->pNalUnitsList[pCurAu->uiStartPos]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.pPps;
 
-  //try to allocate or relocate DPB memory only when IDR arrival.
-  if (NAL_UNIT_CODED_SLICE_IDR == pCurAu->pNalUnitsList[pCurAu->uiStartPos]->sNalHeaderExt.sNalUnitHeader.eNalUnitType ||
-      pCurAu->pNalUnitsList[pCurAu->uiStartPos]->sNalHeaderExt.bIdrFlag) {
+  //try to allocate or relocate DPB memory only when new sequence is coming.
+  if (pCtx->bNewSeqBegin) {
     WelsResetRefPic (pCtx); //clear ref pPic when IDR NAL
-    iErr = SyncPictureResolutionExt (pCtx, (pCtx->iMaxWidthInSps + 15) >> 4, (pCtx->iMaxHeightInSps + 15) >> 4);
+    iErr = SyncPictureResolutionExt (pCtx, pCtx->pSps->iMbWidth, pCtx->pSps->iMbHeight);
 
     if (ERR_NONE != iErr) {
-      WelsLog (pCtx, WELS_LOG_WARNING, "sync picture resolution ext failed,  the error is %d", iErr);
+      WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING, "sync picture resolution ext failed,  the error is %d", iErr);
       return iErr;
     }
   }
 
-
-  pDstInfo->eBufferProperty = (EBufferProperty)pCtx->iDecoderOutputProperty;
-
-  iErr = DecodeCurrentAccessUnit (pCtx, ppDst, iStride, &iWidth, &iHeight, pDstInfo);
+  iErr = DecodeCurrentAccessUnit (pCtx, ppDst, pDstInfo);
 
   WelsDecodeAccessUnitEnd (pCtx);
 
   if (ERR_NONE != iErr) {
-    WelsLog (pCtx, WELS_LOG_INFO, "returned error from decoding:[0x%x]\n", iErr);
-
-    pDstInfo->iBufferStatus = 0;
+    WelsLog (& (pCtx->sLogCtx), WELS_LOG_INFO, "returned error from decoding:[0x%x]", iErr);
     return iErr;
   }
 
   return 0;
 }
 
-static inline void_t InitDqLayerInfo (PDqLayer pDqLayer, PLayerInfo pLayerInfo, PNalUnit pNalUnit, PPicture pPicDec) {
+static inline void InitDqLayerInfo (PDqLayer pDqLayer, PLayerInfo pLayerInfo, PNalUnit pNalUnit, PPicture pPicDec) {
   PNalUnitHeaderExt pNalHdrExt    = &pNalUnit->sNalHeaderExt;
   PSliceHeaderExt pShExt			= &pNalUnit->sNalData.sVclNal.sSliceHeaderExt;
   PSliceHeader        pSh			= &pShExt->sSliceHeader;
@@ -1667,6 +1990,14 @@ static inline void_t InitDqLayerInfo (PDqLayer pDqLayer, PLayerInfo pLayerInfo, 
   if (kuiQualityId == BASE_QUALITY_ID) {
     pDqLayer->pRefPicListReordering		= &pSh->pRefPicListReordering;
     pDqLayer->pRefPicMarking		= &pSh->sRefMarking;
+    
+    if (pSh->pPps->bWeightedPredFlag) {
+      pDqLayer->bUseWeightPredictionFlag = true;
+      pDqLayer->pPredWeightTable    = &pSh->sPredWeightTable;
+
+    } else
+      pDqLayer->bUseWeightPredictionFlag = false;
+
     pDqLayer->pRefPicBaseMarking	= &pShExt->sRefBasePicMarking;
   }
 
@@ -1674,48 +2005,35 @@ static inline void_t InitDqLayerInfo (PDqLayer pDqLayer, PLayerInfo pLayerInfo, 
   pDqLayer->bUseRefBasePicFlag	= pNalHdrExt->bUseRefBasePicFlag;
 }
 
-void_t WelsDqLayerDecodeStart (PWelsDecoderContext pCtx, PNalUnit pCurNal, PSps pSps, PPps pPps) {
-  SNalUnitHeader* pNalHdr = &pCurNal->sNalHeaderExt.sNalUnitHeader;
+void WelsDqLayerDecodeStart (PWelsDecoderContext pCtx, PNalUnit pCurNal, PSps pSps, PPps pPps) {
   PSliceHeader pSh = &pCurNal->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
 
   pCtx->eSliceType			= pSh->eSliceType;
   pCtx->pSliceHeader			= pSh;
 
   pCtx->iFrameNum			= pSh->iFrameNum;
-
-  if ((pNalHdr->eNalUnitType == NAL_UNIT_CODED_SLICE_IDR ||
-       (pCurNal->sNalHeaderExt.uiQualityId == BASE_QUALITY_ID && pCurNal->sNalHeaderExt.bIdrFlag)) &&
-      pSh->iFrameNum == 0) { //pSh->iFrameNum == 0 this condition can deleted??????
-    WelsResetRefPic (pCtx);	// Reset decoded picture buffer lists due to an IDR frame incomes
-  }
 }
 
-int32_t InitRefPicList (PWelsDecoderContext pCtx, const uint8_t kuiNRi, const bool_t kbFirstSlice, int32_t iPoc) {
+int32_t InitRefPicList (PWelsDecoderContext pCtx, const uint8_t kuiNRi, int32_t iPoc) {
   int32_t iRet = ERR_NONE;
-  if (kbFirstSlice)
-    iRet = WelsInitRefList (pCtx, iPoc);
-  if ((pCtx->eSliceType != I_SLICE && pCtx->eSliceType != SI_SLICE) && kbFirstSlice) {
+  iRet = WelsInitRefList (pCtx, iPoc);
+  if ((pCtx->eSliceType != I_SLICE && pCtx->eSliceType != SI_SLICE)) {
     iRet = WelsReorderRefList (pCtx);
   }
 
   return iRet;
 }
 
-void_t InitCurDqLayerData (PWelsDecoderContext pCtx, PDqLayer pCurDq) {
+void InitCurDqLayerData (PWelsDecoderContext pCtx, PDqLayer pCurDq) {
   if (NULL != pCtx && NULL != pCurDq) {
-    pCurDq->pCsData[0]		= pCtx->pCsListXchg[0][0];
-    pCurDq->pCsData[1]		= pCtx->pCsListXchg[0][1];
-    pCurDq->pCsData[2]		= pCtx->pCsListXchg[0][2];
-    pCurDq->iCsStride[0]	= pCtx->iCsStride[0];
-    pCurDq->iCsStride[1]	= pCtx->iCsStride[1];
-    pCurDq->iCsStride[2]	= pCtx->iCsStride[2];
-
     pCurDq->pMbType			= pCtx->sMb.pMbType[0];
     pCurDq->pSliceIdc		= pCtx->sMb.pSliceIdc[0];
     pCurDq->pMv[0]			= pCtx->sMb.pMv[0][0];
     pCurDq->pRefIndex[0]    = pCtx->sMb.pRefIndex[0][0];
     pCurDq->pLumaQp         = pCtx->sMb.pLumaQp[0];
     pCurDq->pChromaQp       = pCtx->sMb.pChromaQp[0];
+    pCurDq->pMvd[0]       = pCtx->sMb.pMvd[0][0];
+    pCurDq->pCbfDc       = pCtx->sMb.pCbfDc[0];
     pCurDq->pNzc			= pCtx->sMb.pNzc[0];
     pCurDq->pNzcRs			= pCtx->sMb.pNzcRs[0];
     pCurDq->pScaledTCoeff   = pCtx->sMb.pScaledTCoeff[0];
@@ -1726,23 +2044,16 @@ void_t InitCurDqLayerData (PWelsDecoderContext pCtx, PDqLayer pCurDq) {
     pCurDq->pSubMbType      = pCtx->sMb.pSubMbType[0];
     pCurDq->pInterPredictionDoneFlag = pCtx->sMb.pInterPredictionDoneFlag[0];
     pCurDq->pResidualPredFlag = pCtx->sMb.pResidualPredFlag[0];
+    pCurDq->pMbCorrectlyDecodedFlag = pCtx->sMb.pMbCorrectlyDecodedFlag[0];
+    pCurDq->pMbRefConcealedFlag = pCtx->sMb.pMbRefConcealedFlag[0];
   }
-}
-
-// added to reset state of parameter sets to waiting successive incoming IDR, 6/4/2010
-// It will be called in case packets lost/ broken and decoded failed at temporal level 0
-void_t ResetParameterSetsState (PWelsDecoderContext pCtx) {
-  pCtx->bSpsExistAheadFlag	   = false;
-  pCtx->bSubspsExistAheadFlag = false;
-  pCtx->bPpsExistAheadFlag	   = false;
 }
 
 /*
  * DecodeCurrentAccessUnit
  * Decode current access unit when current AU is completed.
  */
-int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int32_t* pDstLen, int32_t* pWidth,
-                                 int32_t* pHeight, SBufferInfo* pDstInfo) {
+int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, SBufferInfo* pDstInfo) {
   int32_t iRefCount[LIST_A];
   PNalUnit pNalCur = NULL;
   PAccessUnit pCurAu = pCtx->pAccessUnitList;
@@ -1753,14 +2064,15 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
   int32_t iPpsId = 0;
   int32_t iRet = ERR_NONE;
 
+  bool bAllRefComplete = true; // Assume default all ref picutres are complete
+
   const uint8_t kuiTargetLayerDqId = GetTargetDqId (pCtx->uiTargetDqId, pCtx->pParam);
   const uint8_t kuiDependencyIdMax = (kuiTargetLayerDqId & 0x7F) >> 4;
   int16_t iLastIdD = -1, iLastIdQ = -1;
   int16_t iCurrIdD = 0, iCurrIdQ = 0;
   uint8_t uiNalRefIdc = 0;
-  bool_t	bFreshSliceAvailable =
+  bool	bFreshSliceAvailable =
     true;	// Another fresh slice comingup for given dq layer, for multiple slices in case of header parts of slices sometimes loss over error-prone channels, 8/14/2008
-  PPicture  pStoreBasePic = NULL;
 
   //update pCurDqLayer at the starting of AU decoding
   if (pCtx->bInitialDqLayersMem) {
@@ -1778,33 +2090,33 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
 
     if (pCtx->pDec == NULL) {
       pCtx->pDec = PrefetchPic (pCtx->pPicBuff[0]);
+      if (pCtx->iTotalNumMbRec != 0)
+        pCtx->iTotalNumMbRec = 0;
 
       if (NULL == pCtx->pDec) {
-        WelsLog (pCtx, WELS_LOG_ERROR, "DecodeCurrentAccessUnit()::::::PrefetchPic ERROR, pSps->iNumRefFrames:%d.\n",
+        WelsLog (& (pCtx->sLogCtx), WELS_LOG_ERROR,
+                 "DecodeCurrentAccessUnit()::::::PrefetchPic ERROR, pSps->iNumRefFrames:%d.",
                  pCtx->pSps->iNumRefFrames);
         pCtx->iErrorCode |= dsOutOfMemory;
         return ERR_INFO_REF_COUNT_OVERFLOW;
       }
+      pCtx->pDec->bNewSeqBegin = pCtx->bNewSeqBegin; //set flag for start decoding
     }
+    pCtx->pDec->uiTimeStamp = pNalCur->uiTimeStamp;
 
-#ifdef NO_WAITING_AU
-    //For fixing the nal lossing issue
-    if ((pCtx->pDec->iTotalNumMbRec != 0) &&
-        (CheckAccessUnitBoundaryExt (&pCtx->sLastNalHdrExt, &pNalCur->sNalHeaderExt, &pCtx->sLastSliceHeader,
-                                     &pNalCur->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader))) {
-      pCtx->pDec->iTotalNumMbRec = 0;
-    }
-#else
-    //initialize at the starting of AU.
-    pCtx->pDec->iTotalNumMbRec = 0;
-#endif
-    if (pCtx->pDec->iTotalNumMbRec == 0) { //Picture start to decode
+    if (pCtx->iTotalNumMbRec == 0) { //Picture start to decode
       for (int32_t i = 0; i < LAYER_NUM_EXCHANGEABLE; ++ i)
         memset (pCtx->sMb.pSliceIdc[i], 0xff, (pCtx->sMb.iMbWidth * pCtx->sMb.iMbHeight * sizeof (int32_t)));
+      memset (pCtx->pCurDqLayer->pMbCorrectlyDecodedFlag, 0, pCtx->pSps->iMbWidth * pCtx->pSps->iMbHeight * sizeof (bool));
+      memset (pCtx->pCurDqLayer->pMbRefConcealedFlag, 0, pCtx->pSps->iMbWidth * pCtx->pSps->iMbHeight * sizeof (bool));
+      pCtx->pDec->iMbNum = pCtx->pSps->iMbWidth * pCtx->pSps->iMbHeight;
+      pCtx->pDec->iMbEcedNum = 0;
+      pCtx->pDec->iMbEcedPropNum = 0;
     }
+    pCtx->bRPLRError = false;
     GetI4LumaIChromaAddrTable (pCtx->iDecBlockOffsetArray, pCtx->pDec->iLinesize[0], pCtx->pDec->iLinesize[1]);
 
-    if (pNalCur->sNalHeaderExt.uiLayerDqId > kuiTargetLayerDqId) {
+    if (pNalCur->sNalHeaderExt.uiLayerDqId > kuiTargetLayerDqId) { // confirmed pNalCur will never be NULL
       break;	// Per formance it need not to decode the remaining bits any more due to given uiLayerDqId required, 9/2/2009
     }
 
@@ -1814,18 +2126,19 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
      *	Loop decoding for slices (even FMO and/ multiple slices) within a dq layer
      */
     while (iIdx <= iEndIdx) {
-      BOOL_T         bReconstructSlice;
+      bool         bReconstructSlice;
       iCurrIdQ	= pNalCur->sNalHeaderExt.uiQualityId;
       iCurrIdD	= pNalCur->sNalHeaderExt.uiDependencyId;
       pSh		= &pNalCur->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
       pShExt	= &pNalCur->sNalData.sVclNal.sSliceHeaderExt;
-
-      bReconstructSlice = CheckSliceNeedReconstruct (iCurrIdD, iCurrIdQ, pShExt->bStoreRefBasePicFlag,
-                          kuiDependencyIdMax, pNalCur->sNalHeaderExt.uiLayerDqId, kuiTargetLayerDqId);
+      pCtx->bRPLRError = false;
+      bReconstructSlice = CheckSliceNeedReconstruct (pNalCur->sNalHeaderExt.uiLayerDqId, kuiTargetLayerDqId);
 
       memcpy (&pLayerInfo.sNalHeaderExt, &pNalCur->sNalHeaderExt, sizeof (SNalUnitHeaderExt)); //confirmed_safe_unsafe_usage
 
       pCtx->pDec->iFrameNum = pSh->iFrameNum;
+      pCtx->pDec->iFramePoc = pSh->iPicOrderCntLsb; // still can not obtain correct, because current do not support POCtype 2
+      pCtx->pDec->bIdrFlag = pNalCur->sNalHeaderExt.bIdrFlag;
 
       memcpy (&pLayerInfo.sSliceInLayer.sSliceHeaderExt, pShExt, sizeof (SSliceHeaderExt)); //confirmed_safe_unsafe_usage
       pLayerInfo.sSliceInLayer.bSliceHeaderExtFlag	= pNalCur->sNalData.sVclNal.bSliceHeaderExtFlag;
@@ -1844,7 +2157,7 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
       pCtx->pFmo = &pCtx->sFmoList[iPpsId];
       if (!FmoParamUpdate (pCtx->pFmo, pLayerInfo.pSps, pLayerInfo.pPps, &pCtx->iActiveFmoNum)) {
         pCtx->iErrorCode |= dsBitstreamError;
-        WelsLog (pCtx, WELS_LOG_WARNING, "DecodeCurrentAccessUnit(), FmoParamUpdate failed, eSliceType: %d.\n",
+        WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING, "DecodeCurrentAccessUnit(), FmoParamUpdate failed, eSliceType: %d.",
                  pSh->eSliceType);
         return GENERATE_ERROR_NO (ERR_LEVEL_SLICE_HEADER, ERR_INFO_FMO_INIT_FAIL);
       }
@@ -1863,35 +2176,43 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
         InitDqLayerInfo (dq_cur, &pLayerInfo, pNalCur, pCtx->pDec);
 
         if (!dq_cur->sLayerInfo.pSps->bGapsInFrameNumValueAllowedFlag) {
-          const bool_t kbIdrFlag = dq_cur->sLayerInfo.sNalHeaderExt.bIdrFlag
-                                   || (dq_cur->sLayerInfo.sNalHeaderExt.sNalUnitHeader.eNalUnitType == NAL_UNIT_CODED_SLICE_IDR);
+          const bool kbIdrFlag = dq_cur->sLayerInfo.sNalHeaderExt.bIdrFlag
+                                 || (dq_cur->sLayerInfo.sNalHeaderExt.sNalUnitHeader.eNalUnitType == NAL_UNIT_CODED_SLICE_IDR);
           // Subclause 8.2.5.2 Decoding process for gaps in frame_num
           if (!kbIdrFlag  &&
               pSh->iFrameNum != pCtx->iPrevFrameNum &&
               pSh->iFrameNum != ((pCtx->iPrevFrameNum + 1) & ((1 << dq_cur->sLayerInfo.pSps->uiLog2MaxFrameNum) - 1))) {
-            WelsLog (pCtx, WELS_LOG_WARNING,
-                     "referencing pictures lost due frame gaps exist, prev_frame_num: %d, curr_frame_num: %d\n", pCtx->iPrevFrameNum,
+            WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING,
+                     "referencing pictures lost due frame gaps exist, prev_frame_num: %d, curr_frame_num: %d", pCtx->iPrevFrameNum,
                      pSh->iFrameNum);
 
-#ifdef LONG_TERM_REF
-            pCtx->bParamSetsLostFlag = true;
-#else
-            pCtx->bReferenceLostAtT0Flag = true;
-#endif
-            ResetParameterSetsState (pCtx);
-
+            bAllRefComplete = false;
             pCtx->iErrorCode |= dsRefLost;
-            return ERR_INFO_REFERENCE_PIC_LOST;
+            if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) {
+#ifdef LONG_TERM_REF
+              pCtx->bParamSetsLostFlag = true;
+#else
+              pCtx->bReferenceLostAtT0Flag = true;
+#endif
+              return ERR_INFO_REFERENCE_PIC_LOST;
+            }
           }
         }
 
         if (iCurrIdD == kuiDependencyIdMax && iCurrIdQ == BASE_QUALITY_ID) {
-          iRet = InitRefPicList (pCtx, uiNalRefIdc, bFreshSliceAvailable, pSh->iPicOrderCntLsb);
+          iRet = InitRefPicList (pCtx, uiNalRefIdc, pSh->iPicOrderCntLsb);
           if (iRet) {
+            pCtx->bRPLRError = true;
+            bAllRefComplete = false; // RPLR error, set ref pictures complete flag false
             HandleReferenceLost (pCtx, pNalCur);
-            WelsLog (pCtx, WELS_LOG_WARNING, "reference picture introduced by this frame is lost during transmission! uiTId: %d\n",
+            WelsLog (& (pCtx->sLogCtx), WELS_LOG_DEBUG,
+                     "reference picture introduced by this frame is lost during transmission! uiTId: %d",
                      pNalCur->sNalHeaderExt.uiTemporalId);
-            return iRet;
+            if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) {
+              if (pCtx->iTotalNumMbRec == 0)
+                pCtx->pDec = NULL;
+              return iRet;
+            }
           }
         }
 
@@ -1899,14 +2220,29 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
 
         //Output good store_base reconstruction when enhancement quality layer occurred error for MGS key picture case
         if (iRet != ERR_NONE) {
-          WelsLog (pCtx, WELS_LOG_WARNING, "DecodeCurrentAccessUnit() failed (%d) in frame: %d uiDId: %d uiQId: %d\n",
+          WelsLog (& (pCtx->sLogCtx), WELS_LOG_WARNING,
+                   "DecodeCurrentAccessUnit() failed (%d) in frame: %d uiDId: %d uiQId: %d",
                    iRet, pSh->iFrameNum, iCurrIdD, iCurrIdQ);
+          bAllRefComplete = false;
           HandleReferenceLostL0 (pCtx, pNalCur);
-          return iRet;
+          if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) {
+            if (pCtx->iTotalNumMbRec == 0)
+              pCtx->pDec = NULL;
+            return iRet;
+          }
         }
-        if (bReconstructSlice)	{
+
+        if (bReconstructSlice) {
           if (WelsDecodeConstructSlice (pCtx, pNalCur)) {
+            pCtx->pDec->bIsComplete = false; // reconstruction error, directly set the flag false
             return -1;
+          }
+        }
+        if (bAllRefComplete && pCtx->eSliceType != I_SLICE) {
+          if (pCtx->sRefPic.uiRefCount[LIST_0] > 0) {
+            bAllRefComplete &= CheckRefPicturesComplete (pCtx);
+          } else {
+            bAllRefComplete = false;
           }
         }
       }
@@ -1931,6 +2267,12 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
         break;
     }
 
+    // Set the current dec picture complete flag. The flag will be reset when current picture need do ErrorCon.
+    pCtx->pDec->bIsComplete = bAllRefComplete;
+    if (!pCtx->pDec->bIsComplete) {  // Ref pictures ECed, result in ECed
+      pCtx->iErrorCode |= dsDataErrorConcealed;
+    }
+
     // A dq layer decoded here
 #if defined (_DEBUG) &&  !defined (CODEC_FOR_TESTBED)
 #undef fprintf
@@ -1940,36 +2282,39 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
 #endif//#if !CODEC_FOR_TESTBED
 
     if (dq_cur->uiLayerDqId == kuiTargetLayerDqId) {
-      if (DecodeFrameConstruction (pCtx, ppDst, pDstLen, pWidth, pHeight, pDstInfo)) {
-#ifdef NO_WAITING_AU
-        memcpy (&pCtx->sLastNalHdrExt, &pCurAu->pNalUnitsList[iIdx - 1]->sNalHeaderExt, sizeof (SNalUnitHeaderExt));
-        memcpy (&pCtx->sLastSliceHeader, &pCurAu->pNalUnitsList[iIdx - 1]->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader,
-                sizeof (SSliceHeader));
-        return ERR_NONE;
-#else
-        pCtx->iErrorCode |= dsBitstreamError;
-        return -1;
-#endif
-
+      if (!pCtx->bInstantDecFlag) {
+        if (!pCtx->bParseOnly) {
+          //Do error concealment here
+          if ((NeedErrorCon (pCtx)) && (pCtx->eErrorConMethod != ERROR_CON_DISABLE)) {
+            ImplementErrorCon (pCtx);
+            pCtx->iTotalNumMbRec = pCtx->pSps->iMbWidth * pCtx->pSps->iMbHeight;
+            pCtx->pDec->iSpsId = pCtx->pSps->iSpsId;
+            pCtx->pDec->iPpsId = pCtx->pPps->iPpsId;
+          }
+        }
       }
-      if ((uiNalRefIdc > 0) && (iCurrIdQ || (!dq_cur->bStoreRefBasePicFlag))) {
-        WelsMarkAsRef (pCtx, false);
-        ExpandReferencingPicture (pCtx->pDec, pCtx->sExpandPicFunc.pExpandLumaPicture,
-                                  pCtx->sExpandPicFunc.pExpandChromaPicture);
-        pCtx->pDec = NULL;
-      }
-    }
 
-    if ((iCurrIdD == kuiDependencyIdMax) && (iCurrIdQ == BASE_QUALITY_ID) && (dq_cur->bStoreRefBasePicFlag)) {
-      pStoreBasePic = pCtx->pDec;
+      iRet = DecodeFrameConstruction (pCtx, ppDst, pDstInfo);
+      if (iRet)
+        return iRet;
 
+      pCtx->pPreviousDecodedPictureInDpb = pCtx->pDec; //store latest decoded picture for EC
       if (uiNalRefIdc > 0) {
-        WelsMarkAsRef (pCtx, true);
-        ExpandReferencingPicture (pCtx->pDec, pCtx->sExpandPicFunc.pExpandLumaPicture,
-                                  pCtx->sExpandPicFunc.pExpandChromaPicture);
-        pCtx->pDec = NULL;
+        iRet = WelsMarkAsRef (pCtx);
+        if (iRet != ERR_NONE) {
+          if (pCtx->eErrorConMethod == ERROR_CON_DISABLE) {
+            pCtx->pDec = NULL;
+            return iRet;
+          }
+        }
+        if (!pCtx->bParseOnly)
+          ExpandReferencingPicture (pCtx->pDec->pData, pCtx->pDec->iWidthInPixel, pCtx->pDec->iHeightInPixel,
+                                    pCtx->pDec->iLinesize,
+                                    pCtx->sExpandPicFunc.pfExpandLumaPicture, pCtx->sExpandPicFunc.pfExpandChromaPicture);
       }
+      pCtx->pDec = NULL; //after frame decoding, always set to NULL
     }
+
     // need update frame_num due current frame is well decoded
     pCtx->iPrevFrameNum	= pSh->iFrameNum;
     if (pCtx->bLastHasMmco5)
@@ -1979,4 +2324,95 @@ int32_t DecodeCurrentAccessUnit (PWelsDecoderContext pCtx, uint8_t** ppDst, int3
   return ERR_NONE;
 }
 
+bool CheckAndFinishLastPic (PWelsDecoderContext pCtx, uint8_t** ppDst, SBufferInfo* pDstInfo) {
+  PAccessUnit pAu = pCtx->pAccessUnitList;
+  bool bAuBoundaryFlag = false;
+  if (IS_VCL_NAL (pCtx->sCurNalHead.eNalUnitType, 1)) { //VCL data, AU list should have data
+    PNalUnit pCurNal = pAu->pNalUnitsList[pAu->uiEndPos];
+    bAuBoundaryFlag = (pCtx->iTotalNumMbRec != 0)
+                      && (CheckAccessUnitBoundaryExt (&pCtx->sLastNalHdrExt, &pCurNal->sNalHeaderExt, &pCtx->sLastSliceHeader,
+                          &pCurNal->sNalData.sVclNal.sSliceHeaderExt.sSliceHeader));
+  } else { //non VCL
+    if (pCtx->sCurNalHead.eNalUnitType == NAL_UNIT_AU_DELIMITER) {
+      bAuBoundaryFlag = true;
+    } else if (pCtx->sCurNalHead.eNalUnitType == NAL_UNIT_SEI) {
+      bAuBoundaryFlag = true;
+    } else if (pCtx->sCurNalHead.eNalUnitType == NAL_UNIT_SPS) {
+      bAuBoundaryFlag = !! (pCtx->iOverwriteFlags & OVERWRITE_SPS);
+    } else if (pCtx->sCurNalHead.eNalUnitType == NAL_UNIT_SUBSET_SPS) {
+      bAuBoundaryFlag = !! (pCtx->iOverwriteFlags & OVERWRITE_SUBSETSPS);
+    } else if (pCtx->sCurNalHead.eNalUnitType == NAL_UNIT_PPS) {
+      bAuBoundaryFlag = !! (pCtx->iOverwriteFlags & OVERWRITE_PPS);
+    }
+    if (bAuBoundaryFlag && pCtx->pAccessUnitList->uiAvailUnitsNum != 0) { //Construct remaining data first
+      ConstructAccessUnit (pCtx, ppDst, pDstInfo);
+    }
+  }
+
+  //Do Error Concealment here
+  if (bAuBoundaryFlag && (pCtx->iTotalNumMbRec != 0) && NeedErrorCon (pCtx)) { //AU ready but frame not completely reconed
+    if (pCtx->eErrorConMethod != ERROR_CON_DISABLE) {
+      ImplementErrorCon (pCtx);
+      pCtx->iTotalNumMbRec = pCtx->pSps->iMbWidth * pCtx->pSps->iMbHeight;
+      pCtx->pDec->iSpsId = pCtx->pSps->iSpsId;
+      pCtx->pDec->iPpsId = pCtx->pPps->iPpsId;
+
+      DecodeFrameConstruction (pCtx, ppDst, pDstInfo);
+      pCtx->pPreviousDecodedPictureInDpb = pCtx->pDec; //save ECed pic for future use
+      if (pCtx->sLastNalHdrExt.sNalUnitHeader.uiNalRefIdc > 0) {
+        MarkECFrameAsRef (pCtx);
+      }
+    } else if (pCtx->bParseOnly) { //clear parse only internal data status
+      pCtx->pParserBsInfo->iNalNum = 0;
+    } else {
+      if (DecodeFrameConstruction (pCtx, ppDst, pDstInfo)) {
+        pCtx->pDec = NULL;
+        return false;
+      }
+    }
+    pCtx->pDec = NULL;
+    pCtx->iPrevFrameNum = pCtx->sLastSliceHeader.iFrameNum; //save frame_num
+    if (pCtx->bLastHasMmco5)
+      pCtx->iPrevFrameNum = 0;
+  }
+  return ERR_NONE;
+}
+
+bool CheckRefPicturesComplete (PWelsDecoderContext pCtx) {
+  // Multi Reference, RefIdx may differ
+  bool bAllRefComplete = true;
+  int32_t iRealMbIdx;
+  for (int32_t iMbIdx = 0; bAllRefComplete
+       && iMbIdx < pCtx->pCurDqLayer->sLayerInfo.sSliceInLayer.iTotalMbInCurSlice; iMbIdx++) {
+    iRealMbIdx = pCtx->pCurDqLayer->sLayerInfo.sSliceInLayer.sSliceHeaderExt.sSliceHeader.iFirstMbInSlice + iMbIdx;
+    switch (pCtx->pCurDqLayer->pMbType[iRealMbIdx]) {
+    case MB_TYPE_SKIP:
+    case MB_TYPE_16x16:
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][0] ]->bIsComplete;
+      break;
+
+    case MB_TYPE_16x8:
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][0] ]->bIsComplete;
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][8] ]->bIsComplete;
+      break;
+
+    case MB_TYPE_8x16:
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][0] ]->bIsComplete;
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][2] ]->bIsComplete;
+      break;
+
+    case MB_TYPE_8x8:
+    case MB_TYPE_8x8_REF0:
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][0] ]->bIsComplete;
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][2] ]->bIsComplete;
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][8] ]->bIsComplete;
+      bAllRefComplete &= pCtx->sRefPic.pRefList[ LIST_0 ][ pCtx->pCurDqLayer->pRefIndex[0][iRealMbIdx][10] ]->bIsComplete;
+      break;
+
+    default:
+      break;
+    }
+  }
+  return bAllRefComplete;
+}
 } // namespace WelsDec

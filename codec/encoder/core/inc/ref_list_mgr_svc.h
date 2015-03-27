@@ -46,23 +46,18 @@
 #include "encoder_context.h"
 #include "codec_app_def.h"
 
-namespace WelsSVCEnc {
-typedef enum {
-RECIEVE_UNKOWN = 0,
-RECIEVE_SUCCESS = 1,
-RECIEVE_FAILED = 2,
-} LTR_MARKING_RECEIVE_STATE;
+namespace WelsEnc {
 
 typedef enum {
 LTR_DIRECT_MARK = 0,
-LTR_DELAY_MARK = 1,
+LTR_DELAY_MARK = 1
 } LTR_MARKING_PROCESS_MODE;
 
 typedef enum {
 FRAME_NUM_EQUAL    = 0x01,
 FRAME_NUM_BIGGER   = 0x02,
 FRAME_NUM_SMALLER  = 0x04,
-FRAME_NUM_OVER_MAX = 0x08,
+FRAME_NUM_OVER_MAX = 0x08
 } COMPARE_FRAME_NUM;
 
 /*
@@ -77,11 +72,11 @@ void WelsResetRefList (sWelsEncCtx* pCtx);
 /*
  *	update reference picture list
  */
-BOOL_T WelsUpdateRefList (sWelsEncCtx* pCtx);
+bool WelsUpdateRefList (sWelsEncCtx* pCtx);
 /*
  *	build reference picture list
  */
-BOOL_T WelsBuildRefList (sWelsEncCtx* pCtx, const int32_t kiPOC);
+bool WelsBuildRefList (sWelsEncCtx* pCtx, const int32_t kiPOC, int32_t iBestLtrRefIdx);
 
 /*
  *	update syntax for reference base related
@@ -92,14 +87,16 @@ void WelsUpdateRefSyntax (sWelsEncCtx* pCtx, const int32_t kiPOC, const int32_t 
 /*
 * check current mark iFrameNum used in LTR list or not
 */
-bool_t CheckCurMarkFrameNumUsed (sWelsEncCtx* pCtx);
+bool CheckCurMarkFrameNumUsed (sWelsEncCtx* pCtx);
 /*
 *	decide whether current frame include long term reference mark and update long term reference mark syntax
 */
 void WelsMarkPic (sWelsEncCtx* pCtx);
 
+void InitRefListMgrFunc (SWelsFuncPtrList* pFuncList, const bool bEnableLongTermReference, const bool bScreenContent);
+
 #ifdef LONG_TERM_REF_DUMP
-void dump_ref (sWelsEncCtx* ctx);
+void DumpRef (sWelsEncCtx* ctx);
 #endif
 }
 #endif//REFERENCE_PICTURE_LIST_MANAGEMENT_SVC_H__

@@ -52,20 +52,20 @@
 #include "as264_common.h"
 #include "wels_preprocess.h"
 #include "wels_func_ptr_def.h"
+#include "crt_util_safe_x.h"
+#include "utils.h"
 
-#ifdef MT_ENABLED
-#include "mt_defs.h"	// for multiple threadin, 
+#include "mt_defs.h"	// for multiple threadin,
 #include "WelsThreadLib.h"
-#endif//MT_ENALBED
 
-namespace WelsSVCEnc {
+namespace WelsEnc {
 
 /*
  *	reference list for each quality layer in SVC
  */
 typedef struct TagRefList {
   SPicture*					pShortRefList[1 + MAX_SHORT_REF_COUNT]; // reference list 0 - int16_t
-  SPicture*					pLongRefList[1 + MAX_LONG_REF_COUNT];	// reference list 1 - int32_t
+  SPicture*					pLongRefList[1 + MAX_REF_PIC_COUNT];	// reference list 1 - int32_t
   SPicture*					pNextBuffer;
   SPicture*					pRef[1 + MAX_REF_PIC_COUNT];	// plus 1 for swap intend
   uint8_t						uiShortRefCount;
@@ -73,27 +73,29 @@ typedef struct TagRefList {
 } SRefList;
 
 typedef struct TagLTRState {
-  // LTR mark feedback
+// LTR mark feedback
   uint32_t		    		uiLtrMarkState;	// LTR mark state, indicate whether there is a LTR mark feedback unsolved
   int32_t						iLtrMarkFbFrameNum;// the unsolved LTR mark feedback, the marked iFrameNum feedback from decoder
 
-  // LTR used as recovery reference
+// LTR used as recovery reference
   int32_t						iLastRecoverFrameNum; // reserve the last LTR or IDR recover iFrameNum
   int32_t
   iLastCorFrameNumDec; // reserved the last correct position in decoder side, use to select valid LTR to recover or to decide the LTR mark validation
   int32_t
   iCurFrameNumInDec; // current iFrameNum in decoder side, use to select valid LTR to recover or to decide the LTR mark validation
 
-  // LTR mark
+// LTR mark
   int32_t						iLTRMarkMode; // direct mark or delay mark
   int32_t						iLTRMarkSuccessNum; //successful marked num, for mark mode switch
   int32_t						iCurLtrIdx;// current int32_t term reference index to mark
-  int32_t						iLastLtrIdx;
+  int32_t						iLastLtrIdx[MAX_TEMPORAL_LAYER_NUM];
+  int32_t						iSceneLtrIdx;// related to Scene LTR, used by screen content
+
   uint32_t					uiLtrMarkInterval;// the interval from the last int32_t term pRef mark
 
-  bool_t						bLTRMarkingFlag;	//decide whether current frame marked as LTR
-  bool_t						bLTRMarkEnable; //when LTR is confirmed and the interval is no smaller than the marking period
-  bool_t						bReceivedT0LostFlag;	// indicate whether a t0 lost feedback is recieved, for LTR recovery
+  bool						bLTRMarkingFlag;	//decide whether current frame marked as LTR
+  bool						bLTRMarkEnable; //when LTR is confirmed and the interval is no smaller than the marking period
+  bool						bReceivedT0LostFlag;	// indicate whether a t0 lost feedback is recieved, for LTR recovery
 } SLTRState;
 
 typedef struct TagSpatialPicIndex {
@@ -109,13 +111,17 @@ typedef struct TagStrideTables {
 } SStrideTables;
 
 typedef struct TagWelsEncCtx {
-  // Input
+  SLogContext sLogCtx;
+// Input
   SWelsSvcCodingParam*		pSvcParam;	// SVC parameter, WelsSVCParamConfig in svc_param_settings.h
   SWelsSliceBs*		 	pSliceBs;		// bitstream buffering for various slices, [uiSliceIdx]
 
   int32_t*					pSadCostMb;
   /* MVD cost tables for Inter MB */
-  uint16_t*					pMvdCostTableInter; //[52];	// adaptive to spatial layers
+  int32_t              iMvRange;
+  uint16_t*					pMvdCostTable; //[52];	// adaptive to spatial layers
+  int32_t					  iMvdCostTableSize; //the size of above table
+  int32_t					    iMvdCostTableStride; //the stride of above table
   SMVUnitXY*
   pMvUnitBlock4x4;	// (*pMvUnitBlock4x4[2])[MB_BLOCK4x4_NUM];	    // for store each 4x4 blocks' mv unit, the two swap after different d layer
   int8_t*
@@ -128,13 +134,11 @@ typedef struct TagWelsEncCtx {
   SStrideTables*				pStrideTab;	// stride tables for internal coding used
   SWelsFuncPtrList*			pFuncList;
 
-#if defined(MT_ENABLED)
   SSliceThreading*				pSliceThreading;
-#endif//MT_ENABLED
 
-  // SSlice context
+// SSlice context
   SSliceCtx*				pSliceCtxList;// slice context table for each dependency quality layer
-  // pointers
+// pointers
   SPicture*					pEncPic;			// pointer to current picture to be encoded
   SPicture*					pDecPic;			// pointer to current picture being reconstructed
   SPicture*					pRefPic;			// pointer to current reference picture
@@ -146,11 +150,10 @@ typedef struct TagWelsEncCtx {
   SRefList**					ppRefPicListExt;		// reference picture list for SVC
   SPicture*					pRefList0[16];
   SLTRState*					pLtr;//[MAX_DEPENDENCY_LAYER];
-
-  // Derived
+  bool                          bCurFrameMarkedAsSceneLtr;
+// Derived
   int32_t						iCodingIndex;
   int32_t						iFrameIndex;			// count how many frames elapsed during coding context currently
-  uint32_t					uiFrameIdxRc;           //only for RC
   int32_t						iFrameNum;				// current frame number coding
   int32_t						iPOC;					// frame iPOC
   EWelsSliceType				eSliceType;			// currently coding slice type
@@ -161,15 +164,22 @@ typedef struct TagWelsEncCtx {
 
   uint8_t						uiDependencyId;	// Idc of dependecy layer to be coded
   uint8_t						uiTemporalId;	// Idc of temporal layer to be coded
-  bool_t						bNeedPrefixNalFlag;	// whether add prefix nal
-  bool_t                      bEncCurFrmAsIdrFlag;
+  bool						bNeedPrefixNalFlag;	// whether add prefix nal
+  bool                      bEncCurFrmAsIdrFlag;
 
-  // Rate control routine
+// Rate control routine
   SWelsSvcRc*					pWelsSvcRc;
+  bool              bCheckWindowStatusRefreshFlag;
+  int64_t           iCheckWindowStartTs;
+  int64_t           iCheckWindowCurrentTs;
+  int32_t           iCheckWindowInterval;
+  int32_t           iCheckWindowIntervalShift;
+  bool              bCheckWindowShiftResetFlag;
   int32_t						iSkipFrameFlag; //_GOM_RC_
+  int32_t           iContinualSkipFrames;
   int32_t						iGlobalQp;		// global qp
 
-  // VAA
+// VAA
   SVAAFrameInfo*		    	pVaa;		    // VAA information of reference
   CWelsPreProcess*				pVpp;
 
@@ -181,25 +191,21 @@ typedef struct TagWelsEncCtx {
   SSubsetSps*					pSubsetArray;	// MAX_SPS_COUNT by standard compatible
   SSubsetSps*					pSubsetSps;
   int32_t						iSpsNum;	// number of pSps used
+  int32_t						iSubsetSpsNum;	// number of pSps used
   int32_t						iPpsNum;	// number of pPps used
 
-  // Output
+// Output
   SWelsEncoderOutput*			pOut;			// for NAL raw pData (need allocating memory for sNalList internal)
   uint8_t*						pFrameBs;		// restoring bitstream pBuffer of all NALs in a frame
   int32_t						iFrameBsSize;	// count size of frame bs in bytes allocated
   int32_t						iPosBsBuffer;	// current writing position of frame bs pBuffer
 
-  /* For Downsampling & VAA I420 based source pictures */
-  SPicture*					pSpatialPic[MAX_DEPENDENCY_LAYER][MAX_TEMPORAL_LEVEL + 1 +
-      LONG_TERM_REF_NUM];	// need memory requirement with total number of (log2(uiGopSize)+1+1+long_term_ref_num)
-
   SSpatialPicIndex			sSpatialIndexMap[MAX_DEPENDENCY_LAYER];
-  uint8_t						uiSpatialLayersInTemporal[MAX_DEPENDENCY_LAYER];
 
-  uint8_t                     uiSpatialPicNum[MAX_DEPENDENCY_LAYER];
-  bool_t						bLongTermRefFlag[MAX_DEPENDENCY_LAYER][MAX_TEMPORAL_LEVEL + 1/*+LONG_TERM_REF_NUM*/];
+  bool						bRefOfCurTidIsLtr[MAX_DEPENDENCY_LAYER][MAX_TEMPORAL_LEVEL];
+  uint16_t        uiIdrPicId;		// IDR picture id: [0, 65535], this one is used for LTR
 
-  int16_t						iMaxSliceCount;// maximal count number of slices for all layers observation
+  int32_t						iMaxSliceCount;// maximal count number of slices for all layers observation
   int16_t						iActiveThreadsNum;	// number of threads active so far
 
   /*
@@ -211,20 +217,57 @@ typedef struct TagWelsEncCtx {
   pDqIdcMap;	// overall DQ map of full scalability in specific frame (All full D/T/Q layers involved)												// pDqIdcMap[dq_index] for each SDqIdc pData
 
   SParaSetOffset				sPSOVector;
+  SParaSetOffset*				pPSOVector;
   CMemoryAlign*				pMemAlign;
 
-#ifdef ENABLE_TRACE_FILE
-  FILE*						pFileLog;		// log file for wels encoder
-  uint32_t					uiSizeLog;		// size of log have been written in file
-
-#endif//ENABLE_TRACE_FILE
-
 #if defined(STAT_OUTPUT)
-  // overall stat pData, refer to SStatData in stat.h, in case avc to use stat[0][0]
+// overall stat pData, refer to SStatData in stat.h, in case avc to use stat[0][0]
   SStatData					sStatData [ MAX_DEPENDENCY_LAYER ] [ MAX_QUALITY_LEVEL ];
   SStatSliceInfo				sPerInfo;
-#endif//STAT_OUTPUT	
+#endif//STAT_OUTPUT
 
+  //related to Statistics
+  int64_t            uiStartTimestamp;
+  SEncoderStatistics sEncoderStatistics;
+  int32_t            iStatisticsLogInterval;
+  int64_t            iLastStatisticsLogTs;
+  int64_t            iTotalEncodedBits;
+  int64_t            iLastStatisticsBits;
+  int64_t            iLastStatisticsFrameCount;
+
+  int32_t iEncoderError;
+  WELS_MUTEX					mutexEncoderError;
+  bool bDeliveryFlag;
+  SStateCtx sWelsCabacContexts[4][WELS_QP_MAX + 1][WELS_CONTEXT_COUNT];
+#ifdef ENABLE_FRAME_DUMP
+  bool bDependencyRecFlag[MAX_DEPENDENCY_LAYER];
+  bool bRecFlag;
+#endif
+
+  uint32_t GetNeededSpsNum() {
+    if (0 == sPSOVector.uiNeededSpsNum) {
+      sPSOVector.uiNeededSpsNum = ((SPS_LISTING & pSvcParam->eSpsPpsIdStrategy) ? (MAX_SPS_COUNT) : (1));
+      sPSOVector.uiNeededSpsNum *= ((pSvcParam->bSimulcastAVC) ? (pSvcParam->iSpatialLayerNum) : (1));
+    }
+    return sPSOVector.uiNeededSpsNum;
+  }
+
+  uint32_t GetNeededSubsetSpsNum() {
+    if (0 == sPSOVector.uiNeededSubsetSpsNum) {
+      sPSOVector.uiNeededSubsetSpsNum = ((pSvcParam->bSimulcastAVC) ? (0) :
+                                         ((SPS_LISTING & pSvcParam->eSpsPpsIdStrategy) ? (MAX_SPS_COUNT) : (pSvcParam->iSpatialLayerNum - 1)));
+    }
+    return sPSOVector.uiNeededSubsetSpsNum;
+  }
+
+  uint32_t GetNeededPpsNum() {
+    if (0 == sPSOVector.uiNeededPpsNum) {
+      sPSOVector.uiNeededPpsNum = ((pSvcParam->eSpsPpsIdStrategy & SPS_PPS_LISTING) ? (MAX_PPS_COUNT) :
+                                   (1 + pSvcParam->iSpatialLayerNum));
+      sPSOVector.uiNeededPpsNum *= ((pSvcParam->bSimulcastAVC) ? (pSvcParam->iSpatialLayerNum) : (1));
+    }
+    return sPSOVector.uiNeededPpsNum;
+  }
 } sWelsEncCtx/*, *PWelsEncCtx*/;
 }
 #endif//sWelsEncCtx_H__

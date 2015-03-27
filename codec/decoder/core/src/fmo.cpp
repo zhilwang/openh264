@@ -37,12 +37,9 @@
  *
  *************************************************************************************
  */
-#include <string.h>
 
 #include "fmo.h"
-#include "macros.h"
-#include "utils.h"
-#include "mem_align.h"
+#include "memory_align.h"
 
 namespace WelsDec {
 
@@ -93,7 +90,7 @@ static inline int32_t FmoGenerateMbAllocMapType0 (PFmo pFmo, PPps pPps) {
 static inline int32_t FmoGenerateMbAllocMapType1 (PFmo pFmo, PPps pPps, const int32_t kiMbWidth) {
   uint32_t uiNumSliceGroups = 0;
   int32_t iMbNum = 0;
-  int16_t i = 0;
+  int32_t i = 0;
   WELS_VERIFY_RETURN_IF (1, (NULL == pFmo || NULL == pPps))
   uiNumSliceGroups = pPps->uiNumSliceGroups;
   iMbNum			 = pFmo->iCountMbNum;
@@ -122,7 +119,7 @@ static inline int32_t FmoGenerateSliceGroup (PFmo pFmo, const PPps kpPps, const 
     const int32_t kiMbHeight) {
   int32_t iNumMb	= 0;
   int32_t iErr		= 0;
-  bool_t	bResolutionChanged = false;
+  bool	bResolutionChanged = false;
 
   // the cases we would not like
   WELS_VERIFY_RETURN_IF (1, (NULL == pFmo || NULL == kpPps))
@@ -136,7 +133,7 @@ static inline int32_t FmoGenerateSliceGroup (PFmo pFmo, const PPps kpPps, const 
 
 
   WelsFree (pFmo->pMbAllocMap, "_fmo->pMbAllocMap");
-  pFmo->pMbAllocMap	= (uint8_t*)WelsMalloc (iNumMb * sizeof (uint8_t), "_fmo->pMbAllocMap");
+  pFmo->pMbAllocMap	= (uint8_t*)WelsMallocz (iNumMb * sizeof (uint8_t), "_fmo->pMbAllocMap");
   WELS_VERIFY_RETURN_IF (1, (NULL == pFmo->pMbAllocMap))	// out of memory
 
   pFmo->iCountMbNum	= iNumMb;
@@ -203,7 +200,7 @@ int32_t	InitFmo (PFmo pFmo, PPps pPps, const int32_t kiMbWidth, const int32_t ki
  *
  * \return	NONE
  */
-void_t UninitFmoList (PFmo pFmo, const int32_t kiCnt, const int32_t kiAvail) {
+void UninitFmoList (PFmo pFmo, const int32_t kiCnt, const int32_t kiAvail) {
   PFmo pIter = pFmo;
   int32_t i = 0;
   int32_t iFreeNodes = 0;
@@ -241,8 +238,8 @@ void_t UninitFmoList (PFmo pFmo, const int32_t kiCnt, const int32_t kiAvail) {
  *
  * \return	true - changed or not initialized yet; false - not change at all
  */
-bool_t FmoParamSetsChanged (PFmo pFmo, const int32_t kiCountNumMb, const int32_t kiSliceGroupType,
-                            const int32_t kiSliceGroupCount) {
+bool FmoParamSetsChanged (PFmo pFmo, const int32_t kiCountNumMb, const int32_t kiSliceGroupType,
+                          const int32_t kiSliceGroupCount) {
   WELS_VERIFY_RETURN_IF (false, (NULL == pFmo))
 
   return ((!pFmo->bActiveFlag)
@@ -261,7 +258,7 @@ bool_t FmoParamSetsChanged (PFmo pFmo, const int32_t kiCountNumMb, const int32_t
  *
  * \return	true - update/insert successfully; false - failed;
  */
-bool_t FmoParamUpdate (PFmo pFmo, PSps pSps, PPps pPps, int32_t* pActiveFmoNum) {
+bool FmoParamUpdate (PFmo pFmo, PSps pSps, PPps pPps, int32_t* pActiveFmoNum) {
   const uint32_t kuiMbWidth = pSps->iMbWidth;
   const uint32_t kuiMbHeight = pSps->iMbHeight;
 

@@ -37,18 +37,14 @@
  *
  *************************************************************************************
  */
-#include <string.h>
 #include "pic_queue.h"
-#include "wels_const.h"
-#include "utils.h"
-#include "macros.h"
 #include "decoder_context.h"
 #include "codec_def.h"
-#include "mem_align.h"
+#include "memory_align.h"
 
 namespace WelsDec {
 
-void_t FreePicture (PPicture pPic);
+void FreePicture (PPicture pPic);
 
 
 ///////////////////////////////////Recycled queue management for pictures///////////////////////////////////
@@ -73,7 +69,7 @@ PPicture AllocPicture (PWelsDecoderContext pCtx, const int32_t kiPicWidth, const
   int32_t iLumaSize			= 0;
   int32_t iChromaSize			= 0;
 
-  pPic	= (PPicture) WelsMalloc (sizeof (SPicture), "PPicture");
+  pPic	= (PPicture) WelsMallocz (sizeof (SPicture), "PPicture");
   WELS_VERIFY_RETURN_IF (NULL, NULL == pPic);
 
   memset (pPic, 0, sizeof (SPicture));
@@ -85,11 +81,18 @@ PPicture AllocPicture (PWelsDecoderContext pCtx, const int32_t kiPicWidth, const
 
   iLumaSize	= iPicWidth * iPicHeight;
   iChromaSize	= iPicChromaWidth * iPicChromaHeight;
-  if (pCtx->iDecoderMode == SW_MODE) {
-    pPic->pBuffer[0]	= static_cast<uint8_t*> (WelsMalloc (iLumaSize /* luma */
-                        + (iChromaSize << 1) /* Cb,Cr */, "_pic->buffer[0]"));
 
+  if (pCtx->bParseOnly) {
+    pPic->pBuffer[0] = pPic->pBuffer[1] = pPic->pBuffer[2] = NULL;
+    pPic->pData[0] = pPic->pData[1] = pPic->pData[2] = NULL;
+    pPic->iLinesize[0] = iPicWidth;
+    pPic->iLinesize[1] = pPic->iLinesize[2] = iPicChromaWidth;
+  } else {
+    pPic->pBuffer[0]	= static_cast<uint8_t*> (WelsMallocz (iLumaSize /* luma */
+                        + (iChromaSize << 1) /* Cb,Cr */, "_pic->buffer[0]"));
     WELS_VERIFY_RETURN_PROC_IF (NULL, NULL == pPic->pBuffer[0], FreePicture (pPic));
+
+    memset (pPic->pBuffer[0], 128, (iLumaSize + (iChromaSize << 1)));
     pPic->iLinesize[0] = iPicWidth;
     pPic->iLinesize[1] = pPic->iLinesize[2] = iPicChromaWidth;
     pPic->pBuffer[1]	= pPic->pBuffer[0] + iLumaSize;
@@ -98,9 +101,6 @@ PPicture AllocPicture (PWelsDecoderContext pCtx, const int32_t kiPicWidth, const
     pPic->pData[1]	= pPic->pBuffer[1] + /*WELS_ALIGN*/ (((1 + pPic->iLinesize[1]) * PADDING_LENGTH) >> 1);
     pPic->pData[2]	= pPic->pBuffer[2] + /*WELS_ALIGN*/ (((1 + pPic->iLinesize[2]) * PADDING_LENGTH) >> 1);
   }
-
-
-
   pPic->iPlanes		= 3;	// yv12 in default
   pPic->iWidthInPixel	= kiPicWidth;
   pPic->iHeightInPixel = kiPicHeight;
@@ -110,7 +110,7 @@ PPicture AllocPicture (PWelsDecoderContext pCtx, const int32_t kiPicWidth, const
   return pPic;
 }
 
-void_t FreePicture (PPicture pPic) {
+void FreePicture (PPicture pPic) {
   if (NULL != pPic) {
 
     if (pPic->pBuffer[0]) {
@@ -141,7 +141,7 @@ PPicture PrefetchPic (PPicBuff pPicBuf) {
     pPicBuf->iCurrentIdx = iPicIdx;
     return pPic;
   }
-  for (iPicIdx = 0 ; iPicIdx < pPicBuf->iCurrentIdx ; ++iPicIdx) {
+  for (iPicIdx = 0 ; iPicIdx <= pPicBuf->iCurrentIdx ; ++iPicIdx) {
     if (pPicBuf->ppPic[iPicIdx] != NULL && pPicBuf->ppPic[iPicIdx]->bAvailableFlag
         && !pPicBuf->ppPic[iPicIdx]->bUsedAsRef) {
       pPic = pPicBuf->ppPic[iPicIdx];

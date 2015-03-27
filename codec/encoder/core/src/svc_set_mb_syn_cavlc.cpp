@@ -38,12 +38,11 @@
  *************************************************************************************
  */
 
-#include "svc_enc_golomb.h"
 #include "vlc_encoder.h"
 #include "ls_defines.h"
-#include "svc_set_mb_syn_cavlc.h"
+#include "svc_set_mb_syn.h"
 
-namespace WelsSVCEnc {
+namespace WelsEnc {
 const uint32_t g_kuiIntra4x4CbpMap[48] = {
   3, 29, 30, 17, 31, 18, 37,  8, 32, 38, 19,  9, 20, 10, 11, 2, //15
   16, 33, 34, 21, 35, 22, 39,  4, 36, 40, 23,  5, 24,  6,  7, 1, //31
@@ -69,7 +68,7 @@ void WelsSpatialWriteMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb) 
   int32_t i = 0;
 
   SMVUnitXY sMvd[2];
-  bool_t* pPredFlag;
+  bool* pPredFlag;
   int8_t* pRemMode;
 
   int32_t iMbOffset = 0;
@@ -177,7 +176,7 @@ void WelsSpatialWriteSubMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurM
   int32_t iNumRefIdxl0ActiveMinus1 = pSliceHeadExt->sSliceHeader.uiNumRefIdxL0Active - 1;
   int32_t i;
 
-  bool_t bSubRef0 = false;
+  bool bSubRef0 = false;
   const uint8_t* kpScan4 = & (g_kuiMbCountScan4Idx[0]);
 
   /* mb type */
@@ -209,40 +208,68 @@ void WelsSpatialWriteSubMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurM
   }
 }
 
+int32_t CheckBitstreamBuffer (const uint32_t	kuiSliceIdx, sWelsEncCtx* pEncCtx,  SBitStringAux* pBs) {
+  const intX_t iLeftLength = pBs->pEndBuf - pBs->pCurBuf - 1;
+  assert (iLeftLength > 0);
+
+  if (iLeftLength < MAX_MACROBLOCK_SIZE_IN_BYTE_x2) {
+    return ENC_RETURN_MEMALLOCERR;
+    //TODO: call the realloc&copy instead
+  }
+  return ENC_RETURN_SUCCESS;
+}
+
 //============================Base Layer CAVLC Writing===============================
-void WelsSpatialWriteMbSyn (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb) {
+int32_t WelsSpatialWriteMbSyn (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb) {
   SBitStringAux* pBs = pSlice->pSliceBsa;
   SMbCache* pMbCache = &pSlice->sMbCacheInfo;
+  const uint8_t kuiChromaQpIndexOffset = pEncCtx->pCurDqLayer->sLayerInfo.pPpsP->uiChromaQpIndexOffset;
 
-  /* Step 1: write mb type and pred */
-  if (IS_Inter_8x8 (pCurMb->uiMbType)) {
-    WelsSpatialWriteSubMbPred (pEncCtx, pSlice, pCurMb);
+  if (IS_SKIP (pCurMb->uiMbType)) {
+    pCurMb->uiLumaQp	= pSlice->uiLastMbQp;
+    pCurMb->uiChromaQp = g_kuiChromaQpTable[CLIP3_QP_0_51 (pCurMb->uiLumaQp + kuiChromaQpIndexOffset)];
+
+    pSlice->iMbSkipRun++;
+    return ENC_RETURN_SUCCESS;
   } else {
-    WelsSpatialWriteMbPred (pEncCtx, pSlice, pCurMb);
-  }
+    if (pEncCtx->eSliceType != I_SLICE) {
+      BsWriteUE (pBs, pSlice->iMbSkipRun);
+      pSlice->iMbSkipRun = 0;
+    }
+    /* Step 1: write mb type and pred */
+    if (IS_Inter_8x8 (pCurMb->uiMbType)) {
+      WelsSpatialWriteSubMbPred (pEncCtx, pSlice, pCurMb);
+    } else {
+      WelsSpatialWriteMbPred (pEncCtx, pSlice, pCurMb);
+    }
 
-  /* Step 2: write coded block patern */
-  if (IS_INTRA4x4 (pCurMb->uiMbType)) {
-    BsWriteUE (pBs, g_kuiIntra4x4CbpMap[pCurMb->uiCbp]);
-  } else if (!IS_INTRA16x16 (pCurMb->uiMbType)) {
-    BsWriteUE (pBs, g_kuiInterCbpMap[pCurMb->uiCbp]);
-  }
+    /* Step 2: write coded block patern */
+    if (IS_INTRA4x4 (pCurMb->uiMbType)) {
+      BsWriteUE (pBs, g_kuiIntra4x4CbpMap[pCurMb->uiCbp]);
+    } else if (!IS_INTRA16x16 (pCurMb->uiMbType)) {
+      BsWriteUE (pBs, g_kuiInterCbpMap[pCurMb->uiCbp]);
+    }
 
-  /* Step 3: write QP and residual */
-  if (pCurMb->uiCbp > 0 || IS_INTRA16x16 (pCurMb->uiMbType)) {
-    const int32_t kiDeltaQp = pCurMb->uiLumaQp - pSlice->uiLastMbQp;
-    pSlice->uiLastMbQp = pCurMb->uiLumaQp;
+    /* Step 3: write QP and residual */
+    if (pCurMb->uiCbp > 0 || IS_INTRA16x16 (pCurMb->uiMbType)) {
+      const int32_t kiDeltaQp = pCurMb->uiLumaQp - pSlice->uiLastMbQp;
+      pSlice->uiLastMbQp = pCurMb->uiLumaQp;
 
-    BsWriteSE (pBs, kiDeltaQp);
-    WelsWriteMbResidual (pMbCache, pCurMb, pBs);
-  } else {
-    pCurMb->uiLumaQp = pSlice->uiLastMbQp;
-    pCurMb->uiChromaQp = g_kuiChromaQpTable[CLIP3_QP_0_51 (pCurMb->uiLumaQp +
-                                            pEncCtx->pCurDqLayer->sLayerInfo.pPpsP->uiChromaQpIndexOffset)];
+      BsWriteSE (pBs, kiDeltaQp);
+      if (WelsWriteMbResidual (pEncCtx->pFuncList, pMbCache, pCurMb, pBs))
+        return ENC_RETURN_VLCOVERFLOWFOUND;
+    } else {
+      pCurMb->uiLumaQp = pSlice->uiLastMbQp;
+      pCurMb->uiChromaQp = g_kuiChromaQpTable[CLIP3_QP_0_51 (pCurMb->uiLumaQp +
+                                              pEncCtx->pCurDqLayer->sLayerInfo.pPpsP->uiChromaQpIndexOffset)];
+    }
+
+    /* Step 4: Check the left buffer */
+    return CheckBitstreamBuffer (pSlice->uiSliceIdx, pEncCtx, pBs);
   }
 }
 
-void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pBs) {
+int32_t WelsWriteMbResidual (SWelsFuncPtrList* pFuncList, SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pBs) {
   int32_t i;
   Mb_Type uiMbType					= pCurMb->uiMbType;
   const int32_t kiCbpChroma		= pCurMb->uiCbp >> 4;
@@ -256,7 +283,8 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
     iA = pNonZeroCoeffCount[8];
     iB = pNonZeroCoeffCount[ 1];
     WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-    WriteBlockResidualCavlc (sMbCacheInfo->pDct->iLumaI16x16Dc, 15, 1, LUMA_4x4, iC, pBs);
+    if (WriteBlockResidualCavlc (pFuncList, sMbCacheInfo->pDct->iLumaI16x16Dc, 15, 1, LUMA_4x4, iC, pBs))
+      return ENC_RETURN_VLCOVERFLOWFOUND;
 
     /* AC Luma */
     if (kiCbpLuma) {
@@ -267,7 +295,8 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
         iA = pNonZeroCoeffCount[iIdx - 1];
         iB = pNonZeroCoeffCount[iIdx - 8];
         WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-        WriteBlockResidualCavlc (pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, LUMA_AC, iC, pBs);
+        if (WriteBlockResidualCavlc (pFuncList, pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, LUMA_AC, iC, pBs))
+          return ENC_RETURN_VLCOVERFLOWFOUND;
         pBlock += 16;
       }
     }
@@ -286,22 +315,26 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
           iA = pNonZeroCoeffCount[iIdx - 1];
           iB = pNonZeroCoeffCount[iIdx - 8];
           WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-          WriteBlockResidualCavlc (pBlock, 15, kiA > 0, LUMA_4x4, iC, pBs);
+          if (WriteBlockResidualCavlc (pFuncList, pBlock, 15, kiA > 0, LUMA_4x4, iC, pBs))
+            return ENC_RETURN_VLCOVERFLOWFOUND;
 
           iA = kiA;
           iB = pNonZeroCoeffCount[iIdx - 7];
           WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-          WriteBlockResidualCavlc (pBlock + 16, 15, kiB > 0, LUMA_4x4, iC, pBs);
+          if (WriteBlockResidualCavlc (pFuncList, pBlock + 16, 15, kiB > 0, LUMA_4x4, iC, pBs))
+            return ENC_RETURN_VLCOVERFLOWFOUND;
 
           iA = pNonZeroCoeffCount[iIdx + 7];
           iB = kiA;
           WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-          WriteBlockResidualCavlc (pBlock + 32, 15, kiC > 0, LUMA_4x4, iC, pBs);
+          if (WriteBlockResidualCavlc (pFuncList, pBlock + 32, 15, kiC > 0, LUMA_4x4, iC, pBs))
+            return ENC_RETURN_VLCOVERFLOWFOUND;
 
           iA = kiC;
           iB = kiB;
           WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-          WriteBlockResidualCavlc (pBlock + 48, 15, kiD > 0, LUMA_4x4, iC, pBs);
+          if (WriteBlockResidualCavlc (pFuncList, pBlock + 48, 15, kiD > 0, LUMA_4x4, iC, pBs))
+            return ENC_RETURN_VLCOVERFLOWFOUND;
         }
         pBlock += 64;
       }
@@ -311,10 +344,12 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
   if (kiCbpChroma) {
     /* Chroma DC residual present */
     pBlock = sMbCacheInfo->pDct->iChromaDc[0]; // Cb
-    WriteBlockResidualCavlc (pBlock, 3, 1, CHROMA_DC, CHROMA_DC_NC_OFFSET, pBs);
+    if (WriteBlockResidualCavlc (pFuncList, pBlock, 3, 1, CHROMA_DC, CHROMA_DC_NC_OFFSET, pBs))
+      return ENC_RETURN_VLCOVERFLOWFOUND;
 
     pBlock += 4; // Cr
-    WriteBlockResidualCavlc (pBlock, 3, 1, CHROMA_DC, CHROMA_DC_NC_OFFSET, pBs);
+    if (WriteBlockResidualCavlc (pFuncList, pBlock, 3, 1, CHROMA_DC, CHROMA_DC_NC_OFFSET, pBs))
+      return ENC_RETURN_VLCOVERFLOWFOUND;
 
     /* Chroma AC residual present */
     if (kiCbpChroma & 0x02) {
@@ -326,7 +361,8 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
         iA = pNonZeroCoeffCount[iIdx - 1];
         iB = pNonZeroCoeffCount[iIdx - 8];
         WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-        WriteBlockResidualCavlc (pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, CHROMA_AC, iC, pBs);
+        if (WriteBlockResidualCavlc (pFuncList, pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, CHROMA_AC, iC, pBs))
+          return ENC_RETURN_VLCOVERFLOWFOUND;
         pBlock += 16;
       }
 
@@ -337,11 +373,13 @@ void WelsWriteMbResidual (SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pB
         iA = pNonZeroCoeffCount[iIdx - 1];
         iB = pNonZeroCoeffCount[iIdx - 8];
         WELS_NON_ZERO_COUNT_AVERAGE (iC, iA, iB);
-        WriteBlockResidualCavlc (pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, CHROMA_AC, iC, pBs);
+        if (WriteBlockResidualCavlc (pFuncList, pBlock, 14, pNonZeroCoeffCount[iIdx] > 0, CHROMA_AC, iC, pBs))
+          return ENC_RETURN_VLCOVERFLOWFOUND;
         pBlock += 16;
       }
     }
   }
+  return 0;
 }
 
-} // namespace WelsSVCEnc
+} // namespace WelsEnc

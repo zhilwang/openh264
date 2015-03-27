@@ -35,12 +35,10 @@
 #define WELS_MACROBLOCK_CACHE_H__
 
 #include "typedefs.h"
-#include "wels_common_basis.h"
 #include "wels_const.h"
 #include "macros.h"
 
-namespace WelsSVCEnc {
-//#pragma pack(1)
+namespace WelsEnc {
 
 /*
  *	MB Cache information, such one cache should be defined within a slice
@@ -59,10 +57,7 @@ namespace WelsSVCEnc {
 ////////////////////////mapping scan index////////////////////////
 
 extern const uint8_t g_kuiSmb4AddrIn256[16];
-extern const uint8_t g_kuiMbCountScan4Idx[24];
-extern const uint8_t g_kuiCache30ScanIdx[16];
 extern const uint8_t g_kuiCache12_8x8RefIdx[4];
-extern const uint8_t g_kuiCache48CountScan4Idx[24];
 
 typedef	struct TagDCTCoeff {
 //ALIGNED_DECLARE( int16_t, residual_ac[16], 16 ); //I_16x16
@@ -78,9 +73,9 @@ typedef struct TagMbCache {
 //the followed pData now is promised aligned to 16 bytes
 ALIGNED_DECLARE (SMVComponentUnit, sMvComponents, 16);
 
-ALIGNED_DECLARE_MATRIX_1D (iNonZeroCoeffCount, 48, int8_t, 16);	// Cache line size
+ALIGNED_DECLARE (int8_t, iNonZeroCoeffCount[48], 16);	// Cache line size
 // 	int8_t		iNonZeroCoeffCount[6 * 8];	// Right luma, Chroma(Left Top Cb, Left btm Cr); must follow by iIntraPredMode!
-ALIGNED_DECLARE_MATRIX_1D (iIntraPredMode, 48, int8_t, 16);
+ALIGNED_DECLARE (int8_t, iIntraPredMode[48], 16);
 //	must follow with iNonZeroCoeffCount!
 
 int32_t     iSadCost[4];			//avail 1; unavail 0
@@ -107,14 +102,14 @@ uint8_t* pBestPredI4x4Blk4;//I_4x4
 uint8_t* pBufferInterPredMe;    // [4][400] is enough because only h&v or v&hv or h&hv. but if both h&v&hv is needed when 8 quart pixel, future we have to use [5][400].
 
 //no scan4[] order, just as memory order to store
-//ALIGNED_DECLARE(bool_t, pPrevIntra4x4PredModeFlag[16], 16);//if 1, means no rem_intra4x4_pred_mode; if 0, means rem_intra4x4_pred_mode != 0
-bool_t* pPrevIntra4x4PredModeFlag;
+//ALIGNED_DECLARE(bool, pPrevIntra4x4PredModeFlag[16], 16);//if 1, means no rem_intra4x4_pred_mode; if 0, means rem_intra4x4_pred_mode != 0
+bool* pPrevIntra4x4PredModeFlag;
 //ALIGNED_DECLARE(int8_t, pRemIntra4x4PredModeFlag[16], 16);//-1 as default; if pPrevIntra4x4PredModeFlag==0,
 //pRemIntra4x4PredModeFlag or added by 1 is the best pred_mode
 int8_t* pRemIntra4x4PredModeFlag;
 
 int32_t     iSadCostSkip[4];	     //avail 1; unavail 0
-bool_t      bMbTypeSkip[4];         //1: skip; 0: non-skip
+bool      bMbTypeSkip[4];         //1: skip; 0: non-skip
 int32_t*     pEncSad;
 
 //for residual encoding at the side of Encoder
@@ -124,7 +119,7 @@ uint8_t      uiNeighborIntra; // LEFT_MB_POS:0x01, TOP_MB_POS:0x02, TOPLEFT_MB_P
 uint8_t uiLumaI16x16Mode;
 uint8_t uiChmaI8x8Mode;
 
-bool_t		bCollocatedPredFlag;//denote if current MB is collocated predicted (MV==0).
+bool		bCollocatedPredFlag;//denote if current MB is collocated predicted (MV==0).
 uint32_t	uiRefMbType;
 
 struct {

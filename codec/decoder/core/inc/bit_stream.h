@@ -35,25 +35,12 @@
 #define WELS_BIT_STREAM_H__
 
 #include "typedefs.h"
+#include "wels_common_defs.h"
+#include "golomb_common.h"
+
+using namespace WelsCommon;
 
 namespace WelsDec {
-
-/*
- *	Bit-stream auxiliary reading / writing
- */
-typedef struct TagBitStringAux {
-uint8_t*		pStartBuf;	// buffer to start position
-uint8_t*		pEndBuf;	// buffer + length
-int32_t     iBits;       // count bits of overall bitstreaming input
-
-int32_t     iIndex;      //only for cavlc usage
-uint8_t*		pCurBuf;	// current reading position
-uint32_t    uiCurBits;
-int32_t		iLeftBits;	// count number of available bits left ([1, 8]),
-// need pointer to next byte start position in case 0 bit left then 8 instead
-} SBitStringAux, *PBitStringAux;
-
-//#pragma pack()
 
 /*!
  * \brief	input bits for decoder or initialize bitstream writing in encoder
@@ -64,13 +51,11 @@ int32_t		iLeftBits;	// count number of available bits left ([1, 8]),
  *
  * \return	size of buffer data in byte; failed in -1 return
  */
-int32_t InitBits (PBitStringAux pBitString, const uint8_t* kpBuf, const int32_t kiSize);
+int32_t DecInitBits (PBitStringAux pBitString, const uint8_t* kpBuf, const int32_t kiSize);
 
-void_t InitReadBits (PBitStringAux pBitString);
+int32_t InitReadBits (PBitStringAux pBitString, intX_t iEndOffset);
 
-uint32_t EndianFix (uint32_t uiX);
-
-
+void RBSP2EBSP (uint8_t* pDstBuf, uint8_t* pSrcBuf, const int32_t kiSize);
 
 } // namespace WelsDec
 

@@ -36,8 +36,6 @@
 
 #include "typedefs.h"
 
-//#pragma pack(1)
-
 namespace WelsDec {
 
 /*
@@ -52,6 +50,9 @@ int32_t		iLinesize[4];// linesize of picture planes respectively used currently
 int32_t		iPlanes;			// How many planes are introduced due to color space format?
 // picture information
 
+/*******************************from EC mv copy****************************/
+bool bIdrFlag;
+
 /*******************************from other standard syntax****************************/
 /*from sps*/
 int32_t		iWidthInPixel;	// picture width in pixel
@@ -60,28 +61,29 @@ int32_t		iHeightInPixel;// picture height in pixel
 int32_t		iFramePoc;		// frame POC
 
 /*******************************sef_definition for misc use****************************/
-bool_t		bUsedAsRef;							//for ref pic management
-bool_t		bIsLongRef;	// long term reference frame flag	//for ref pic management
+bool		bUsedAsRef;							//for ref pic management
+bool		bIsLongRef;	// long term reference frame flag	//for ref pic management
 uint8_t		uiRefCount;
-bool_t		bAvailableFlag;	// indicate whether it is available in this picture memory block.
+bool		bAvailableFlag;	// indicate whether it is available in this picture memory block.
 
+bool            bIsComplete;	// indicate whether current picture is complete, not from EC
 /*******************************for future use****************************/
 uint8_t		uiTemporalId;
 uint8_t		uiSpatialId;
 uint8_t		uiQualityId;
-bool_t		bRefBaseFlag;
 
 int32_t		iFrameNum;		// frame number			//for ref pic management
 int32_t		iLongTermFrameIdx;					//id for long term ref pic
 
-int32_t     iTotalNumMbRec; //show how many MB constructed
-
 int32_t     iSpsId; //against mosaic caused by cross-IDR interval reference.
 int32_t     iPpsId;
+unsigned long long uiTimeStamp;
+bool bNewSeqBegin;
+int32_t iMbEcedNum;
+int32_t iMbEcedPropNum;
+int32_t iMbNum;
 } SPicture, *PPicture;	// "Picture" declaration is comflict with Mac system
 
 } // namespace WelsDec
-
-//#pragma pack()
 
 #endif//WELS_PICTURE_H__

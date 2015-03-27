@@ -42,11 +42,10 @@
 #ifndef WELS_ACCESS_UNIT_WRITER_H__
 #define WELS_ACCESS_UNIT_WRITER_H__
 
-#include "bit_stream.h"
 #include "parameter_sets.h"
 #include "param_svc.h"
-
-namespace WelsSVCEnc {
+#include "utils.h"
+namespace WelsEnc {
 /*!
  *************************************************************************************
  * \brief	to write Sequence Parameter Set (SPS)
@@ -98,35 +97,40 @@ int32_t WelsWritePpsSyntax (SWelsPPS* pPps, SBitStringAux* pBitStringAux, SParaS
 /*!
  * \brief	initialize pSps based on configurable parameters in svc
  * \param	pSps				SWelsSPS*
- * \param	layer_param		SDLayerParam*, dependency layer parameter
+ * \param   pLayerParam     SSpatialLayerConfig  dependency layer parameter
+ * \param	pLayerParamInternal		SSpatialLayerInternal*, internal dependency layer parameter
  * \param	iSpsId			SPS Id
  * \return	0 - successful
  *			1 - failed
  */
-int32_t WelsInitSps (SWelsSPS* pSps, SDLayerParam* pLayerParam, const uint32_t kuiIntraPeriod,
-                     const int32_t kiNumRefFrame,
-                     const uint32_t kiSpsId, const bool_t kbEnableFrameCropping, bool_t bEnableRc);
+int32_t WelsInitSps (SWelsSPS* pSps, SSpatialLayerConfig* pLayerParam, SSpatialLayerInternal* pLayerParamInternal,
+                     const uint32_t kuiIntraPeriod, const int32_t kiNumRefFrame,
+                     const uint32_t kiSpsId, const bool kbEnableFrameCropping, bool bEnableRc,
+                     const int32_t kiDlayerCount,bool bSVCBaselayer);
 
 /*!
  * \brief	initialize subset pSps based on configurable parameters in svc
  * \param	pSubsetSps		SSubsetSps*
- * \param	layer_param		SDLayerParam*, dependency layer parameter
+ * \param   pLayerParam     SSpatialLayerConfig  dependency layer parameter
+ * \param	pLayerParamInternal		SSpatialLayerInternal*, internal dependency layer parameter
  * \param	kiSpsId			SPS Id
  * \return	0 - successful
  *			1 - failed
  */
-int32_t WelsInitSubsetSps (SSubsetSps* pSubsetSps, SDLayerParam* pLayerParam, const uint32_t kuiIntraPeriod,
-                           const int32_t kiNumRefFrame,
-                           const uint32_t kiSpsId, const bool_t kbEnableFrameCropping, bool_t bEnableRc);
+int32_t WelsInitSubsetSps (SSubsetSps* pSubsetSps, SSpatialLayerConfig* pLayerParam,
+                           SSpatialLayerInternal* pLayerParamInternal,
+                           const uint32_t kuiIntraPeriod, const int32_t kiNumRefFrame,
+                           const uint32_t kiSpsId, const bool kbEnableFrameCropping, bool bEnableRc,
+                           const int32_t kiDlayerCount);
 
 /*!
  * \brief	initialize pPps based on configurable parameters and pSps(subset pSps) in svc
  * \param	pPps							SWelsPPS*
  * \param	pSps							SWelsSPS*
  * \param	pSubsetSps					SSubsetSps*
- * \param   kbDeblockingFilterPresentFlag			bool_t
+ * \param   kbDeblockingFilterPresentFlag			bool
  * \param	kiPpsId						PPS Id
- * \param	kbUsingSubsetSps					bool_t
+ * \param	kbUsingSubsetSps					bool
  * \return	0 - successful
  *			1 - failed
  */
@@ -134,8 +138,30 @@ int32_t WelsInitPps (SWelsPPS* pPps,
                      SWelsSPS* pSps,
                      SSubsetSps* pSubsetSps,
                      const uint32_t kuiPpsId,
-                     const bool_t kbDeblockingFilterPresentFlag,
-                     const bool_t kbUsingSubsetSps);
+                     const bool kbDeblockingFilterPresentFlag,
+                     const bool kbUsingSubsetSps,
+                     const bool kbEntropyCodingModeFlag);
 
+int32_t WelsCheckRefFrameLimitationNumRefFirst (SLogContext* pLogCtx, SWelsSvcCodingParam* pParam);
+int32_t WelsCheckRefFrameLimitationLevelIdcFirst (SLogContext* pLogCtx, SWelsSvcCodingParam* pParam);
+
+int32_t WelsAdjustLevel (SSpatialLayerConfig* pSpatialLayer);
+
+/*!
+ * \brief	check if the current parameter can found a presenting sps
+ * \param	pParam		      the current encoding paramter in SWelsSvcCodingParam
+ * \param	kbUseSubsetSps	bool
+ * \param	iDlayerIndex		int, the index of current D layer
+ * \param	iDlayerCount	  int, the number of total D layer
+ * \param pSpsArray			  array of all the stored SPSs
+ * \param	pSubsetArray		array of all the stored Subset-SPSs
+ * \return	0 - successful
+ *			   -1 - cannot find existing SPS for current encoder parameter
+ */
+int32_t FindExistingSps (SWelsSvcCodingParam* pParam, const bool kbUseSubsetSps, const int32_t iDlayerIndex,
+                         const int32_t iDlayerCount,  const int32_t iSpsNumInUse,
+                         SWelsSPS* pSpsArray,
+                         SSubsetSps* pSubsetArray,
+                         bool bSVCBaselayer);
 }
 #endif//WELS_ACCESS_UNIT_PARSER_H__

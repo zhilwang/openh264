@@ -43,72 +43,40 @@
 
 #include "encoder_context.h"
 #include "wels_func_ptr_def.h"
-
-namespace WelsSVCEnc {
+#include "deblocking_common.h"
+namespace WelsEnc {
 
 
 //struct tagDeblockingFunc;
 
 typedef struct TagDeblockingFilter {
-uint8_t*		pCsData[3];	// pointer to reconstructed picture pData
-int32_t		iCsStride[3];	// Cs iStride
-int16_t     iMbStride;
-int8_t		iSliceAlphaC0Offset;
-int8_t		iSliceBetaOffset;
-uint8_t     uiLumaQP;
-uint8_t     uiChromaQP;
-uint8_t     uiFilterIdc;
-uint8_t     uiReserved;
+  uint8_t*		pCsData[3];	// pointer to reconstructed picture pData
+  int32_t		iCsStride[3];	// Cs iStride
+  int16_t     iMbStride;
+  int8_t		iSliceAlphaC0Offset;
+  int8_t		iSliceBetaOffset;
+  uint8_t     uiLumaQP;
+  uint8_t     uiChromaQP;
+  uint8_t     uiFilterIdc;
+  uint8_t     uiReserved;
 } SDeblockingFilter;
-
-void DeblockLumaLt4_c (uint8_t* pPixY, int32_t iStrideX, int32_t iStrideY, int32_t iAlpha, int32_t iBeta, int8_t* pTc);
-void DeblockLumaEq4_c (uint8_t* pPixY, int32_t iStrideX, int32_t iStrideY, int32_t iAlpha, int32_t iBeta);
-void DeblockChromaLt4_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStrideX, int32_t iStrideY, int32_t iAlpha,
-                         int32_t iBeta, int8_t* pTc);
-void DeblockChromaEq4_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStrideX, int32_t iStrideY, int32_t iAlpha,
-                         int32_t iBeta);
-
-
-void DeblockLumaLt4V_c (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta, int8_t* pTc);
-void DeblockLumaEq4V_c (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-
-void DeblockLumaLt4H_c (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta, int8_t* pTc);
-void DeblockLumaEq4H_c (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-
-void DeblockChromaLt4V_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta,
-                          int8_t* pTc);
-void DeblockChromaEq4V_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-
-void DeblockChromaLt4H_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta,
-                          int8_t* pTc);
-void DeblockChromaEq4H_c (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta);
 
 #if defined(__cplusplus)
 extern "C" {
 #endif//__cplusplus
-
-#ifdef  X86_ASM
-void DeblockLumaLt4V_sse2 (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta, int8_t* pTc);
-void DeblockLumaEq4V_sse2 (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-void DeblockLumaTransposeH2V_sse2 (uint8_t* pPixY, int32_t iStride, uint8_t* pDst);
-void DeblockLumaTransposeV2H_sse2 (uint8_t* pPixY, int32_t iStride, uint8_t* pSrc);
-void DeblockLumaLt4H_sse2 (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta, int8_t* pTc);
-void DeblockLumaEq4H_sse2 (uint8_t* pPixY, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-void DeblockChromaEq4V_sse2 (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-void DeblockChromaLt4V_sse2 (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta,
-                             int8_t* pTC);
-void DeblockChromaEq4H_sse2 (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta);
-void DeblockChromaLt4H_sse2 (uint8_t* pPixCb, uint8_t* pPixCr, int32_t iStride, int32_t iAlpha, int32_t iBeta,
-                             int8_t* pTC);
+#if defined(HAVE_NEON)
+void DeblockingBSCalcEnc_neon (int8_t* pNzc, SMVUnitXY* pMv, int32_t iBoundryFlag, int32_t iMbStride,
+                               uint8_t (*pBS)[4][4]);
 #endif
-
+#if defined(HAVE_NEON_AARCH64)
+void DeblockingBSCalcEnc_AArch64_neon (int8_t* pNzc, SMVUnitXY* pMv, int32_t iBoundryFlag, int32_t iMbStride,
+                                       uint8_t (*pBS)[4][4]);
+#endif
 #if defined(__cplusplus)
 }
 #endif//__cplusplus
-
 void DeblockingInit (DeblockingFunc*   pFunc,  int32_t iCpu);
 
-void WelsNonZeroCount_c (int8_t* pNonZeroCount);
 void WelsBlockFuncInit (PSetNoneZeroCountZeroFunc* pfSetNZCZero,  int32_t iCpu);
 
 void PerformDeblockingFilter (sWelsEncCtx* pEnc);
