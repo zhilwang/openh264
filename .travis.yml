@@ -4,9 +4,14 @@ compiler:
   - clang
 
 before_install:
-  - sysctl -a | grep machdep.cpu
   - brew update
+  - brew tap homebrew/boneyard
+  - brew versions nasm | grep 2.11.06
+  - cd /usr/local/Library/
+  - git checkout db83e50 /usr/local/Library/Formula/nasm.rb
+  - brew unlink nasm
   - brew install nasm
+  - cd -
 
 install:
   - make gmp-bootstrap
