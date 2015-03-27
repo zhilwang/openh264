@@ -9,7 +9,6 @@ before_install:
   - brew versions nasm | grep 2.11.06
   - cd /usr/local/Library/
   - git checkout db83e50 /usr/local/Library/Formula/nasm.rb
-  - brew unlink nasm
   - brew install nasm
   - cd -
 
